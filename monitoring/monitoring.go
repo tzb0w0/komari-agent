@@ -20,6 +20,7 @@ type report struct {
 	Network     networkReport     `json:"network"`
 	Connections connectionsReport `json:"connections"`
 	GPU         interface{}       `json:"gpu,omitempty"`
+	Retransmit  interface{}       `json:"retransmit,omitempty"`
 	Uptime      uint64            `json:"uptime"`
 	Process     int               `json:"process"`
 	Message     string            `json:"message"`
@@ -97,6 +98,9 @@ func GenerateReport() []byte {
 		message += fmt.Sprintf("failed to get network speed: %v\n", err)
 	}
 	data.Network = networkReport{Up: networkUp, Down: networkDown, TotalUp: totalUp, TotalDown: totalDown}
+
+	// TCP 重传率采集（Linux /proc/net/snmp，非 Linux 自动降级）
+	data.Retransmit = unit.CollectRetransmit()
 
 	tcpCount, udpCount, err := unit.ConnectionsCount()
 	if err != nil {

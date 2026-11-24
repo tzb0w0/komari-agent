@@ -77,6 +77,15 @@ class FakeAgent:
             "gpu_name": "",
             "virtualization": "test",
             "version": "fake-agent/1.0",
+            # 模拟探针自动识别的线路信息（真实 agent 由 line.go 探测出口 IP 的 ASN 得出）
+            "line": {
+                "name": "CN2 GIA",
+                "id": "cn2gia",
+                "carrier": "电信",
+                "asn": 4809,
+                "ip": "127.0.0.1",
+                "source": "auto",
+            },
         }
         self.rpc("agent.basicInfo", {"info": info}, "basic-info")
 
@@ -92,6 +101,13 @@ class FakeAgent:
             "disk": {"total": disk_total, "used": random.randint(disk_total // 5, disk_total * 4 // 5)},
             "network": {"up": random.randint(1_000, 2_000_000), "down": random.randint(1_000, 5_000_000), "totalUp": random.randint(1_000_000, 10_000_000_000), "totalDown": random.randint(1_000_000, 10_000_000_000)},
             "connections": {"tcp": random.randint(1, 100), "udp": random.randint(0, 20)},
+            # 模拟探针采集的 TCP 重传数据（真实 agent 读 /proc/net/snmp 得出）
+            "retransmit": {
+                "rate": round(random.uniform(0.0, 0.8), 2),
+                "retrans": random.randint(0, 50),
+                "out_segs": random.randint(10_000, 50_000),
+                "available": True,
+            },
             "uptime": int(time.monotonic()),
             "process": random.randint(30, 150),
             "message": "fake-agent",

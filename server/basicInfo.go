@@ -58,6 +58,7 @@ func uploadBasicInfo() error {
 		"gpu_name":           monitoring.GpuName(),
 		"virtualization":     monitoring.Virtualized(),
 		"version":            update.CurrentVersion,
+		"line":               monitoring.DetectLine(),
 	}
 
 	return tryUploadData(data)
