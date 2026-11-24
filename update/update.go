@@ -28,7 +28,9 @@ var ErrRestartRequired = errors.New("update installed; restart required")
 
 var (
 	CurrentVersion string = "0.0.1"
-	Repo           string = "komari-monitor/komari-agent"
+	// Repo 指向上游官方仓库时，自动更新会把本定制版覆盖成官方版（丢失线路识别/重传采集）。
+	// 这里固定为本分支仓库，保证自动更新只在自己的 release 内进行。
+	Repo string = "tzb0w0/komari-agent"
 )
 
 const (
