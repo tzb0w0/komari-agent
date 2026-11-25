@@ -8,8 +8,10 @@ import (
 )
 
 func switchAgentVersion(version string, onRestartRequired func()) {
-	if flags.DisableWebSsh {
-		log.Print("Ignoring v2 switch version request because remote control is disabled")
+	// 远程版本切换和 WebSSH 是两件独立的事：禁用终端不应连带禁用升级。
+	// 只有显式关闭自动更新（--disable-auto-update）时才拒绝远程切换。
+	if flags.DisableAutoUpdate {
+		log.Print("Ignoring v2 switch version request because auto update is disabled")
 		return
 	}
 	runSwitchVersion(version, update.CheckAndUpdateForVersionLine, onRestartRequired)
