@@ -65,6 +65,8 @@ var (
 // SetRouteTarget 记录一个后台监控任务的目标（由 agent.ping 事件带入）。
 // target 可能是 1.2.3.4、host、host:80 甚至 [v6]:443，这里统一拆成 host + port。
 func SetRouteTarget(taskID uint, target, pingType string) {
+	// 先恢复落盘的探测结果，保证下面的「缓存是否新鲜」判断拿到的是真实时间
+	routeStateOnce.Do(loadRouteState)
 	host, port := splitHostPort(target)
 	if taskID == 0 || host == "" {
 		return
@@ -89,9 +91,20 @@ func SetRouteTarget(taskID uint, target, pingType string) {
 	monitoredMu.Unlock()
 
 	// 只有地址/端口/类型真的变了才重测；单纯重复下发（每轮 ping 都会带）不触发
-	if !existed || prev.host != next.host || prev.port != next.port || prev.typ != next.typ {
-		scheduleRouteRefresh()
+	if existed && prev.host == next.host && prev.port == next.port && prev.typ == next.typ {
+		return
 	}
+	if !existed {
+		// 重启后 ping 事件会重新登记同一批目标，此时落盘缓存通常仍在 24h 有效期内。
+		// 不能把「重新登记」当成「目标变化」，否则每次重启都会多测一轮。
+		routeCacheMu.Lock()
+		fresh := !routeCacheAt.IsZero() && time.Since(routeCacheAt) < routeTTL
+		routeCacheMu.Unlock()
+		if fresh {
+			return
+		}
+	}
+	scheduleRouteRefresh()
 }
 
 // currentRouteTargets 返回本轮要探测的目标：优先用后台监控目标。
@@ -191,6 +204,11 @@ func GetRoutes() []RouteInfo {
 }
 
 func refreshRoutes() {
+	defer func() {
+		routeCacheMu.Lock()
+		routeDirty = false
+		routeCacheMu.Unlock()
+	}()
 	targets := currentRouteTargets()
 	results := make([]RouteInfo, 0, len(targets))
 
