@@ -186,7 +186,7 @@ func runV2PullLoop(ctx context.Context, onRestartRequired func()) {
 		pullID := fmt.Sprintf("pull-%d", time.Now().UnixNano())
 		ackIDs := snapshotV2AckEventIDs()
 		payload := v2.NewRequest(pullID, v2.MethodAgentPull, map[string]interface{}{
-			"capabilities":  []string{"exec", "ping", "message", "event", "terminal", "file", "startup_config", "switch_version"},
+			"capabilities":  []string{"ping", "message", "event", "file", "startup_config", "switch_version"},
 			"ack_event_ids": ackIDs,
 		})
 		resp, err := postV2RequestContext(ctx, payload)
@@ -373,17 +373,6 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		return true
 	}
 	switch method {
-	case v2.MethodAgentExec:
-		var p struct {
-			TaskID  string `json:"task_id"`
-			Command string `json:"command"`
-		}
-		if err := v2.BindParams(params, &p); err == nil {
-			go NewTask(p.TaskID, p.Command)
-			return true
-		} else {
-			log.Printf("bad v2 exec params: %v", err)
-		}
 	case v2.MethodAgentPing:
 		var p struct {
 			TaskID uint   `json:"ping_task_id"`
