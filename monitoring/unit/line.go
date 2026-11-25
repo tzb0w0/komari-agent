@@ -42,6 +42,8 @@ type LineInfo struct {
 	ASN     int    `json:"asn"`     // 识别到的自治域号
 	IP      string `json:"ip"`      // 出口 IP
 	Source  string `json:"source"`  // 识别来源，固定 "auto"
+	// Routes 是三网回程路由探测结果（精品线路 / 普通骨干），由 route.go 异步填充。
+	Routes []RouteInfo `json:"routes,omitempty"`
 }
 
 var (
@@ -60,6 +62,8 @@ func SetLineDetectInterval(d time.Duration) {
 	lineCacheMu.Lock()
 	lineCacheTTL = d
 	lineCacheMu.Unlock()
+	// 回程路由与线路判定同周期刷新
+	SetRouteInterval(d)
 }
 
 // traceEndpoints 返回出口 IP 的端点。这些端点会回显访问者的 IP。
@@ -78,7 +82,7 @@ func DetectLine() LineInfo {
 	lineCacheMu.Lock()
 	defer lineCacheMu.Unlock()
 	if lineCache.ID != "" && time.Since(lineCacheAt) < lineCacheTTL {
-		return lineCache
+		return withRoutes(lineCache)
 	}
 
 	ip := detectExitIP()
@@ -88,7 +92,7 @@ func DetectLine() LineInfo {
 		info.ID = "unknown"
 		lineCache = info
 		lineCacheAt = time.Now()
-		return info
+		return withRoutes(info)
 	}
 
 	asn := queryASN(ip)
@@ -109,6 +113,12 @@ func DetectLine() LineInfo {
 
 	lineCache = info
 	lineCacheAt = time.Now()
+	return withRoutes(info)
+}
+
+// withRoutes 给线路信息补上回程路由探测结果（可能有延迟，首次为空）。
+func withRoutes(info LineInfo) LineInfo {
+	info.Routes = GetRoutes()
 	return info
 }
 

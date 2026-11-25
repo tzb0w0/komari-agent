@@ -268,6 +268,24 @@ install_dependencies() {
     else
         log_success "Dependencies already satisfied"
     fi
+
+    # 三网回程路由探测依赖 traceroute；装不上也不影响监控（会降级显示「未知」）
+    if ! command -v traceroute >/dev/null 2>&1; then
+        if [ "$EUID" -eq 0 ]; then
+            if command -v apt >/dev/null 2>&1; then
+                apt install -y traceroute >/dev/null 2>&1 || true
+            elif command -v yum >/dev/null 2>&1; then
+                yum install -y traceroute >/dev/null 2>&1 || true
+            elif command -v apk >/dev/null 2>&1; then
+                apk add --no-cache traceroute >/dev/null 2>&1 || true
+            fi
+        fi
+        if command -v traceroute >/dev/null 2>&1; then
+            log_success "traceroute installed (for route detection)"
+        else
+            log_info "traceroute not available; route detection will show unknown"
+        fi
+    fi
 }
 
  
