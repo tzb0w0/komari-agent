@@ -14,18 +14,10 @@ jobs:
 
     strategy:
       matrix:
-        exclude:
-          - goos: windows
-            goarch: arm
-          - goos: darwin
-            goarch: 386
-          - goos: darwin
-            goarch: arm
-        include:
-          - goos: linux
-            goarch: loong64
-        goos: [windows, linux, darwin, freebsd]
-        goarch: [amd64, arm64, 386, arm]
+        # 只发布 Linux 版本：这台的探针只跑在 Linux 服务器上，
+        # macOS / Windows / FreeBSD / 386 等产物用不上，白占发布空间与构建时间。
+        goos: [linux]
+        goarch: [amd64, arm64]
 
     steps:
       - name: Checkout code
