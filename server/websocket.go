@@ -19,17 +19,14 @@ import (
 	"github.com/komari-monitor/komari-agent/monitoring"
 	unit "github.com/komari-monitor/komari-agent/monitoring/unit"
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
-	"github.com/komari-monitor/komari-agent/terminal"
 	"github.com/komari-monitor/komari-agent/utils"
 	"github.com/komari-monitor/komari-agent/ws"
 )
 
 var (
-	v2AckMu        sync.Mutex
-	v2AckEventIDs  []string
-	v2SeenEvents   = make(map[string]time.Time)
-	terminalDialMu sync.Mutex
-	terminalDials  = make(map[string]struct{})
+	v2AckMu       sync.Mutex
+	v2AckEventIDs []string
+	v2SeenEvents  = make(map[string]time.Time)
 )
 
 const (
@@ -387,16 +384,6 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		} else {
 			log.Printf("bad v2 ping params: %v", err)
 		}
-	case v2.MethodAgentTerminal:
-		var p struct {
-			RequestID string `json:"request_id"`
-		}
-		if err := v2.BindParams(params, &p); err == nil {
-			go establishTerminalConnection(flags.Token, p.RequestID, flags.Endpoint)
-			return true
-		} else {
-			log.Printf("bad v2 terminal params: %v", err)
-		}
 	case v2.MethodAgentMessage, v2.MethodAgentEvent:
 		log.Printf("received v2 %s: %+v", method, params)
 		return true
@@ -430,106 +417,6 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 }
 
 // connectWebSocket attempts to establish a WebSocket connection and upload basic info
-
-// establishTerminalConnection 建立终端连接并使用terminal包处理终端操作
-func establishTerminalConnection(token, id, endpoint string) {
-	if id != "" {
-		terminalDialMu.Lock()
-		if _, active := terminalDials[id]; active {
-			terminalDialMu.Unlock()
-			return
-		}
-		terminalDials[id] = struct{}{}
-		terminalDialMu.Unlock()
-		defer func() {
-			terminalDialMu.Lock()
-			delete(terminalDials, id)
-			terminalDialMu.Unlock()
-		}()
-	}
-
-	endpoint = strings.TrimSuffix(endpoint, "/") + "/api/clients/terminal?token=" + token + "&id=" + id
-	endpoint = "ws" + strings.TrimPrefix(endpoint, "http")
-
-	// 转换中文域名为 ASCII 兼容编码
-	if convertedEndpoint, err := utils.ConvertIDNToASCII(endpoint); err == nil {
-		endpoint = convertedEndpoint
-	} else {
-		log.Printf("Warning: Failed to convert Terminal WebSocket IDN to ASCII: %v", err)
-	}
-
-	// 会话保留期间持续重试，避免一次临时网络失败让终端请求永久丢失。
-	const retryWindow = 5 * time.Minute
-	deadline := time.Now().Add(retryWindow)
-	established := false
-	for time.Now().Before(deadline) {
-		dialer := newWSDialer()
-		conn, resp, err := dialer.Dial(endpoint, nil)
-		if resp != nil && resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		if err != nil {
-			if resp != nil && isTerminalPermanentReject(resp.StatusCode) {
-				log.Printf("Terminal session %s rejected by server (%s), closing local session", id, resp.Status)
-				terminal.CloseSession(id)
-				return
-			}
-			if established && !terminal.HasSession(id) {
-				return
-			}
-			log.Println("Failed to establish terminal connection, retrying in 15s:", err)
-			wait := 15 * time.Second
-			if remaining := time.Until(deadline); remaining < wait {
-				wait = remaining
-			}
-			if wait > 0 {
-				time.Sleep(wait)
-			}
-			continue
-		}
-
-		var retry bool
-		if established {
-			retry = terminal.ReattachTerminal(conn, id)
-		} else {
-			established = true
-			retry = terminal.StartTerminal(conn, id)
-		}
-		_ = conn.Close()
-		if !retry {
-			break
-		}
-		// 严格对齐本地会话的保留截止时间：若会话处于浏览器挂起倒计时中，不因
-		// 反复断连而无限延长重试窗口；正常活跃连接断线则获得完整 5 分钟窗口。
-		if sessionDeadline, ok := terminal.SessionDeadline(id); ok {
-			deadline = sessionDeadline
-		} else if !terminal.HasSession(id) {
-			shortDeadline := time.Now().Add(5 * time.Second)
-			if shortDeadline.Before(deadline) {
-				deadline = shortDeadline
-			}
-		} else {
-			deadline = time.Now().Add(retryWindow)
-		}
-		// 会话已建连后因对端断线返回 retry，短暂间隔后即可重连，不必等满 15s。
-		wait := 2 * time.Second
-		if remaining := time.Until(deadline); remaining < wait {
-			wait = remaining
-		}
-		if wait > 0 {
-			time.Sleep(wait)
-		}
-	}
-}
-
-func isTerminalPermanentReject(statusCode int) bool {
-	switch statusCode {
-	case http.StatusNotFound, http.StatusUnauthorized, http.StatusForbidden, http.StatusGone:
-		return true
-	default:
-		return false
-	}
-}
 
 // newWSDialer 构造统一的 WebSocket 拨号器（自定义解析、IPv4/IPv6 动态排序、可选 TLS 忽略）
 func newWSDialer() *websocket.Dialer {
