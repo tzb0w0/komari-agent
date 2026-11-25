@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
 	"github.com/komari-monitor/komari-agent/monitoring/netstatic"
@@ -101,6 +102,9 @@ var RootCmd = &cobra.Command{
 				return fmt.Errorf("auto-discovery failed: %w", err)
 			}
 		}
+		// 从面板同步采集参数（线路判定间隔 / 重传采样窗口）
+		server.StartAgentSettingsSync(15 * time.Minute)
+
 		if err := pkg_flags.CaptureStartupConfig(map[string]interface{}{
 			"warning_panel_host":  warningPanelHost,
 			"warning_run_as_user": warningRunAsUser,

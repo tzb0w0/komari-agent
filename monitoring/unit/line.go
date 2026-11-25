@@ -48,7 +48,19 @@ var (
 	lineCache   LineInfo
 	lineCacheAt time.Time
 	lineCacheMu sync.Mutex
+	// lineCacheTTL 是线路识别结果的缓存时长，默认 24 小时，可由面板配置下发覆盖。
+	lineCacheTTL = 24 * time.Hour
 )
+
+// SetLineDetectInterval 设置线路重新判定间隔（<=0 时忽略）。
+func SetLineDetectInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	lineCacheMu.Lock()
+	lineCacheTTL = d
+	lineCacheMu.Unlock()
+}
 
 // traceEndpoints 返回出口 IP 的端点。这些端点会回显访问者的 IP。
 var traceEndpoints = []string{
@@ -61,11 +73,11 @@ var traceEndpoints = []string{
 var ipv4Re = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 var asnRe = regexp.MustCompile(`(?:AS|as)\s*(\d+)`)
 
-// DetectLine 自动识别当前出口线路，结果缓存 30 分钟。
+// DetectLine 自动识别当前出口线路，默认缓存 24 小时（可由面板配置）。
 func DetectLine() LineInfo {
 	lineCacheMu.Lock()
 	defer lineCacheMu.Unlock()
-	if lineCache.ID != "" && time.Since(lineCacheAt) < 30*time.Minute {
+	if lineCache.ID != "" && time.Since(lineCacheAt) < lineCacheTTL {
 		return lineCache
 	}
 
