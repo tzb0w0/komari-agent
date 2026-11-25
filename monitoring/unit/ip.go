@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
@@ -128,6 +129,13 @@ func GetIPAddress() (ipv4, ipv6 string, err error) {
 			log.Printf("Get Interface List Error: %v", err)
 		} else {
 			ipv4, ipv6 = getIPFromInterfaces(allowNics)
+			// 网卡上只有内网地址（NAT 机器常见）时，对访客没有意义，回退到公网探测
+			if ipv4 != "" && isPrivateIP(ipv4) {
+				log.Printf("NIC IPv4 %s is a private address, falling back to public detection", ipv4)
+				if pub, err := GetIPv4Address(); err == nil && pub != "" {
+					ipv4 = pub
+				}
+			}
 			if ipv4 != "" || ipv6 != "" {
 				log.Printf("Get IP from NIC - IPv4: %s, IPv6: %s", ipv4, ipv6)
 				return ipv4, ipv6, nil
@@ -218,4 +226,13 @@ func getIPFromInterfaces(nicNames []string) (ipv4, ipv6 string) {
 	}
 
 	return ipv4, ipv6
+}
+
+// isPrivateIP 判断是否为内网/回环/链路本地地址。
+func isPrivateIP(raw string) bool {
+	ip := net.ParseIP(strings.TrimSpace(raw))
+	if ip == nil {
+		return false
+	}
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast()
 }

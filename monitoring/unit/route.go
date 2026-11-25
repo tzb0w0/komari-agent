@@ -105,6 +105,23 @@ func GetRoutes() []RouteInfo {
 
 func refreshRoutes() {
 	results := make([]RouteInfo, 0, len(routeTargets))
+
+	// 没有 traceroute/mtr 时直接给出明确结论，避免界面一直显示「探测中」
+	if !hasTraceroute() {
+		for _, t := range routeTargets {
+			results = append(results, RouteInfo{
+				Carrier: t.carrier, Target: t.target,
+				Name: "未安装 traceroute", Tier: "unknown",
+			})
+		}
+		routeCacheMu.Lock()
+		routeCache = results
+		routeCacheAt = time.Now()
+		routeRunning = false
+		routeCacheMu.Unlock()
+		return
+	}
+
 	ch := make(chan RouteInfo, len(routeTargets))
 	for _, t := range routeTargets {
 		go func(carrier, target string) {
@@ -186,4 +203,15 @@ func parseHops(out string) []string {
 		hops = append(hops, ip)
 	}
 	return hops
+}
+
+// hasTraceroute 检查系统是否具备路由探测能力。
+func hasTraceroute() bool {
+	if _, err := exec.LookPath("traceroute"); err == nil {
+		return true
+	}
+	if _, err := exec.LookPath("mtr"); err == nil {
+		return true
+	}
+	return false
 }
