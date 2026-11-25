@@ -17,8 +17,10 @@ package monitoring
 
 import (
 	"context"
+	"net"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,34 +38,39 @@ type RouteInfo struct {
 
 // defaultRouteTargets 仅在还没收到任何监控任务时用于兜底探测。
 var defaultRouteTargets = []routeTarget{
-	{0, "电信", "202.96.209.133"},
-	{0, "联通", "210.22.70.3"},
-	{0, "移动", "211.136.192.6"},
+	{taskID: 0, carrier: "电信", host: "202.96.209.133", typ: "icmp"},
+	{taskID: 0, carrier: "联通", host: "210.22.70.3", typ: "icmp"},
+	{taskID: 0, carrier: "移动", host: "211.136.192.6", typ: "icmp"},
 }
 
 type routeTarget struct {
 	taskID  uint
 	carrier string
-	target  string
+	host    string
+	port    int
+	typ     string // icmp / tcp / udp，决定用哪种探测方式
 }
 
 // monitoredTargets 保存后台下发的监控目标（taskID -> 目标 IP），
 // 回程探测优先使用这些目标，保证「测的就是你在监控的那条线」。
 var (
 	monitoredMu      sync.RWMutex
-	monitoredTargets = map[uint]string{}
+	monitoredTargets = map[uint]routeTarget{}
 	monitoredOrder   []uint
 )
 
-// SetRouteTarget 记录一个后台监控任务的目标地址（由 agent.ping 事件带入）。
-func SetRouteTarget(taskID uint, target string) {
-	target = strings.TrimSpace(target)
-	if taskID == 0 || target == "" {
+// SetRouteTarget 记录一个后台监控任务的目标（由 agent.ping 事件带入）。
+// target 可能是 1.2.3.4、host、host:80 甚至 [v6]:443，这里统一拆成 host + port。
+func SetRouteTarget(taskID uint, target, pingType string) {
+	host, port := splitHostPort(target)
+	if taskID == 0 || host == "" {
 		return
 	}
 	monitoredMu.Lock()
 	_, existed := monitoredTargets[taskID]
-	monitoredTargets[taskID] = target
+	monitoredTargets[taskID] = routeTarget{
+		taskID: taskID, host: host, port: port, typ: strings.ToLower(pingType),
+	}
 	if !existed {
 		monitoredOrder = append(monitoredOrder, taskID)
 		// 目标过多会拖长探测时间，只保留最近写入的若干个
@@ -90,8 +97,8 @@ func currentRouteTargets() []routeTarget {
 	}
 	out := make([]routeTarget, 0, len(monitoredOrder))
 	for _, id := range monitoredOrder {
-		if ip := monitoredTargets[id]; ip != "" {
-			out = append(out, routeTarget{taskID: id, target: ip})
+		if t, ok := monitoredTargets[id]; ok && t.host != "" {
+			out = append(out, t)
 		}
 	}
 	return out
@@ -173,7 +180,7 @@ func refreshRoutes() {
 	if !hasTraceroute() {
 		for _, t := range targets {
 			results = append(results, RouteInfo{
-				TaskID: t.taskID, Carrier: t.carrier, Target: t.target,
+				TaskID: t.taskID, Carrier: t.carrier, Target: t.host,
 				Name: "未安装 traceroute", Tier: "unknown",
 			})
 		}
@@ -187,11 +194,11 @@ func refreshRoutes() {
 
 	ch := make(chan RouteInfo, len(targets))
 	for _, t := range targets {
-		go func(taskID uint, carrier, target string) {
-			info := probeRoute(carrier, target)
-			info.TaskID = taskID
+		go func(t routeTarget) {
+			info := probeRoute(t.carrier, t.host, t.port, t.typ)
+			info.TaskID = t.taskID
 			ch <- info
-		}(t.taskID, t.carrier, t.target)
+		}(t)
 	}
 	for i := 0; i < len(targets); i++ {
 		results = append(results, <-ch)
@@ -205,10 +212,12 @@ func refreshRoutes() {
 }
 
 // probeRoute 对单个目标做 traceroute 并归类。
-func probeRoute(carrier, target string) RouteInfo {
-	info := RouteInfo{Carrier: carrier, Target: target, Name: "未知", Tier: "unknown"}
+func probeRoute(carrier, host string, port int, pingType string) RouteInfo {
+	info := RouteInfo{Carrier: carrier, Target: host, Name: "未知", Tier: "unknown"}
 
-	hops, err := traceroute(target)
+	// TCP/UDP 监控目标：对端多半只开放该端口，用 TCP SYN 探测才有回包
+	tcp := (pingType == "tcp" || pingType == "udp") && port > 0
+	hops, err := traceroute(host, port, tcp)
 	if err != nil || len(hops) == 0 {
 		return info
 	}
@@ -250,12 +259,19 @@ func isInternationalLeg(ip string) bool {
 }
 
 // traceroute 依次尝试 traceroute 与 mtr，返回路径上的跳 IP。
-func traceroute(target string) ([]string, error) {
-	commands := [][]string{
-		{"traceroute", "-n", "-m", maxRouteHops, "-q", "1", "-w", "2", target},
-		{"traceroute", "-n", "-I", "-m", maxRouteHops, "-q", "1", "-w", "2", target},
-		{"mtr", "-r", "-n", "-c", "1", "-m", maxRouteHops, target},
+func traceroute(target string, port int, tcp bool) ([]string, error) {
+	commands := make([][]string, 0, 4)
+	if tcp && port > 0 {
+		commands = append(commands, []string{
+			"traceroute", "-n", "-T", "-p", strconv.Itoa(port),
+			"-m", maxRouteHops, "-q", "1", "-w", "2", target,
+		})
 	}
+	commands = append(commands,
+		[]string{"traceroute", "-n", "-m", maxRouteHops, "-q", "1", "-w", "2", target},
+		[]string{"traceroute", "-n", "-I", "-m", maxRouteHops, "-q", "1", "-w", "2", target},
+		[]string{"mtr", "-r", "-n", "-c", "1", "-m", maxRouteHops, target},
+	)
 	var lastErr error
 	for _, argv := range commands {
 		ctx, cancel := context.WithTimeout(context.Background(), routeProbeTmo)
@@ -299,4 +315,19 @@ func hasTraceroute() bool {
 		return true
 	}
 	return false
+}
+
+// splitHostPort 从监控目标里拆出主机与端口。
+// 支持 1.2.3.4、example.com、example.com:80、[2400::1]:443。
+func splitHostPort(raw string) (string, int) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", 0
+	}
+	host, portStr, err := net.SplitHostPort(raw)
+	if err == nil {
+		port, _ := strconv.Atoi(portStr)
+		return host, port
+	}
+	return raw, 0
 }

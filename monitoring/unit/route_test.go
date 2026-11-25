@@ -62,3 +62,25 @@ func TestParseHops(t *testing.T) {
 		t.Fatalf("unexpected hops: %#v", hops)
 	}
 }
+
+func TestSplitHostPort(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantPort int
+	}{
+		{"210.21.196.6", "210.21.196.6", 0},
+		{"gd-ct-v4.ip.zstaticcdn.com", "gd-ct-v4.ip.zstaticcdn.com", 0},
+		{"gd-ct-v4.ip.zstaticcdn.com:80", "gd-ct-v4.ip.zstaticcdn.com", 80},
+		{"1.2.3.4:443", "1.2.3.4", 443},
+		{"[2400:3200::1]:8080", "2400:3200::1", 8080},
+		{"  1.2.3.4  ", "1.2.3.4", 0},
+		{"", "", 0},
+	}
+	for _, c := range cases {
+		host, port := splitHostPort(c.in)
+		if host != c.wantHost || port != c.wantPort {
+			t.Errorf("splitHostPort(%q) = (%q,%d), want (%q,%d)", c.in, host, port, c.wantHost, c.wantPort)
+		}
+	}
+}

@@ -392,7 +392,7 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		}
 		if err := v2.BindParams(params, &p); err == nil {
 			// 记录后台监控目标，回程线路探测就用这些地址，保证「测的就是你监控的」
-			unit.SetRouteTarget(p.TaskID, p.Target)
+			unit.SetRouteTarget(p.TaskID, p.Target, p.Type)
 			go NewPingTask(conn, p.TaskID, p.Type, p.Target)
 			return true
 		} else {
