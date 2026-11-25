@@ -65,7 +65,8 @@ var (
 // SetRouteTarget 记录一个后台监控任务的目标（由 agent.ping 事件带入）。
 // target 可能是 1.2.3.4、host、host:80 甚至 [v6]:443，这里统一拆成 host + port。
 func SetRouteTarget(taskID uint, target, pingType string) {
-	// 先恢复落盘的探测结果，保证下面的「缓存是否新鲜」判断拿到的是真实时间
+	// 先恢复落盘的探测结果，让重启后的首屏不至于空白。
+	// 注意：loadRouteState 只恢复结果、不恢复探测时间，本进程仍会重新检测一次。
 	routeStateOnce.Do(loadRouteState)
 	host, port := splitHostPort(target)
 	if taskID == 0 || host == "" {
@@ -90,21 +91,12 @@ func SetRouteTarget(taskID uint, target, pingType string) {
 	}
 	monitoredMu.Unlock()
 
-	// 只有地址/端口/类型真的变了才重测；单纯重复下发（每轮 ping 都会带）不触发
-	if existed && prev.host == next.host && prev.port == next.port && prev.typ == next.typ {
-		return
+	// 只有地址/端口/类型真的变了才重测；单纯重复下发（每轮 ping 都会带）不触发。
+	// 重启后 monitoredTargets 为空，重新登记同一批目标会走 !existed 分支并安排一次
+	// 重新检测——这是明确要求的功能（重启即重测），不能跳过。
+	if !existed || prev.host != next.host || prev.port != next.port || prev.typ != next.typ {
+		scheduleRouteRefresh()
 	}
-	if !existed {
-		// 重启后 ping 事件会重新登记同一批目标，此时落盘缓存通常仍在 24h 有效期内。
-		// 不能把「重新登记」当成「目标变化」，否则每次重启都会多测一轮。
-		routeCacheMu.Lock()
-		fresh := !routeCacheAt.IsZero() && time.Since(routeCacheAt) < routeTTL
-		routeCacheMu.Unlock()
-		if fresh {
-			return
-		}
-	}
-	scheduleRouteRefresh()
 }
 
 // currentRouteTargets 返回本轮要探测的目标：优先用后台监控目标。
@@ -187,15 +179,15 @@ func GetRoutes() []RouteInfo {
 	routeStateOnce.Do(loadRouteState)
 	routeCacheMu.Lock()
 	cached := routeCache
-	stale := time.Since(routeCacheAt) >= routeTTL || routeCacheAt.IsZero()
-	start := stale && !routeRunning
-	if start {
-		routeRunning = true
-	}
+	// routeCacheAt 为零表示「本进程尚未探测」：重启后必须重新检测一次。
+	stale := routeCacheAt.IsZero() || time.Since(routeCacheAt) >= routeTTL
+	running := routeRunning
 	routeCacheMu.Unlock()
 
-	if start {
-		go refreshRoutes()
+	if stale && !running {
+		// 统一走去抖调度，等后台监控目标都登记完再测，
+		// 避免重启瞬间目标还没下发时用内置默认地址多测一轮。
+		scheduleRouteRefresh()
 	}
 	if cached == nil {
 		return []RouteInfo{}
@@ -421,7 +413,8 @@ func loadRouteState() {
 	}
 	routeCacheMu.Lock()
 	routeCache = st.Results
-	routeCacheAt = st.ProbedAt
+	// 只恢复结果供首屏显示，刻意不恢复 routeCacheAt：
+	// 重启后按需求必须重新检测一次，本进程仍视为「尚未探测」。
 	routeCacheMu.Unlock()
 }
 
