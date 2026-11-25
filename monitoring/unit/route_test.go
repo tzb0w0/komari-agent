@@ -2,25 +2,55 @@ package monitoring
 
 import "testing"
 
+// 用例取自用户 nexttrace(nq) 的真实三网回程路径
 func TestClassifyHops(t *testing.T) {
 	cases := []struct {
-		name     string
+		desc     string
 		hops     []string
 		wantName string
 		wantTier string
 	}{
-		{"CN2 GIA 优先于 163", []string{"10.0.0.1", "202.97.12.1", "59.43.246.5", "58.60.188.1"}, "CN2 GIA", "premium"},
-		{"纯 163", []string{"10.0.0.1", "202.97.12.1", "61.152.1.1"}, "163", "standard"},
-		{"联通 9929", []string{"172.16.0.1", "218.30.54.1", "210.22.70.1"}, "9929", "premium"},
-		{"联通 169", []string{"219.158.16.1", "210.22.70.1"}, "169", "standard"},
-		{"移动 CMI", []string{"223.120.2.1", "221.176.1.1"}, "CMI", "standard"},
-		{"未知路径", []string{"1.2.3.4", "5.6.7.8"}, "未知", "unknown"},
+		{
+			"广东电信：CUG -> 9929 -> 163",
+			[]string{"10.0.0.1", "186.244.1.1", "162.219.1.1", "218.105.2.1", "210.14.1.1", "202.97.1.1", "113.96.1.1"},
+			"9929", "premium",
+		},
+		{
+			"广东联通：CUG -> 9929 -> 169",
+			[]string{"162.219.1.1", "43.255.1.1", "218.105.2.1", "210.14.1.1", "219.158.1.1"},
+			"9929", "premium",
+		},
+		{
+			"广东移动：CMIN2 -> CMNET",
+			[]string{"223.120.1.1", "221.183.1.1", "111.24.1.1", "211.136.1.1"},
+			"CMIN2", "premium",
+		},
+		{
+			"电信先入 163 再出现 CN2 节点时，按先到者算 163",
+			[]string{"202.97.1.1", "59.43.1.1"},
+			"163", "standard",
+		},
+		{
+			"先出现 CN2 GIA 节点",
+			[]string{"59.43.1.1", "202.97.1.1"},
+			"CN2 GIA", "premium",
+		},
+		{
+			"只有城域节点",
+			[]string{"210.14.1.1"},
+			"联通", "standard",
+		},
+		{
+			"未知路径",
+			[]string{"1.2.3.4", "5.6.7.8"},
+			"未知", "unknown",
+		},
 		{"空路径", nil, "未知", "unknown"},
 	}
 	for _, c := range cases {
 		gotName, gotTier, _ := classifyHops(c.hops)
 		if gotName != c.wantName || gotTier != c.wantTier {
-			t.Errorf("%s: got (%s,%s), want (%s,%s)", c.name, gotName, gotTier, c.wantName, c.wantTier)
+			t.Errorf("%s: got (%s,%s), want (%s,%s)", c.desc, gotName, gotTier, c.wantName, c.wantTier)
 		}
 	}
 }

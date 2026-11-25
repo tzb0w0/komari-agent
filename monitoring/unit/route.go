@@ -49,21 +49,25 @@ var backboneRules = []struct {
 	name   string
 	tier   string
 }{
-	{"59.43.", "CN2 GIA", "premium"},
-	{"218.30.", "9929", "premium"},
-	{"219.158.", "169", "standard"},
-	{"202.97.", "163", "standard"},
-	{"223.119.", "CMI", "standard"},
-	{"223.120.", "CMI", "standard"},
-	{"221.176.", "移动骨干", "standard"},
-	{"221.179.", "移动骨干", "standard"},
-	{"211.136.", "移动城域", "standard"},
-	{"211.139.", "移动城域", "standard"},
-	{"112.96.", "联通城域", "standard"},
-	{"123.125.", "联通城域", "standard"},
-	{"61.152.", "电信城域", "standard"},
-	{"58.60.", "电信城域", "standard"},
+	// 顺序即「同一跳内」的匹配优先级；跨跳时以路径先后为准（先入境内地骨干者胜）
+	{"59.43.", "CN2 GIA", "premium"},  // AS4809 电信 CN2 GIA
+	{"218.105.", "9929", "premium"},   // AS9929 联通 CUII
+	{"218.30.", "9929", "premium"},    // AS9929 国际段
+	{"223.119.", "CMIN2", "premium"},  // AS58807 移动 CMIN2
+	{"223.120.", "CMIN2", "premium"},  // AS58807 移动 CMIN2
+	{"219.158.", "169", "standard"},   // AS4837 联通 169 骨干
+	{"202.97.", "163", "standard"},    // AS4134 电信 163 骨干
+	{"113.96.", "163", "standard"},    // AS4134 广东电信
+	{"221.183.", "CMNET", "standard"}, // AS9808 移动 CMNET
+	{"111.24.", "CMNET", "standard"},  // AS9808 移动 CMNET
+	{"120.198.", "移动", "standard"},    // AS56040 广东移动
+	{"211.136.", "移动", "standard"},    // AS56040 广东移动
+	{"211.139.", "移动", "standard"},    // AS56040 广东移动
+	{"210.14.", "联通", "standard"},     // CNC-BACKBONE 城域
 }
+
+// backboneSkip 是国际段前缀：看到它们说明还没进入内地骨干，继续看下一跳
+var backboneSkip = []string{"162.219.", "43.255.", "203.160."}
 
 var (
 	routeCache    []RouteInfo
@@ -163,16 +167,29 @@ func probeRoute(carrier, target string) RouteInfo {
 	return info
 }
 
-// classifyHops 按规则优先级判定路径类型；未命中任何已知骨干时返回「未知」。
+// classifyHops 按「路径先后」判定：第一个进入内地骨干的节点决定线路类型。
+// 这与 nexttrace 的 “-> ASxxxx” 语义一致，也符合回程测试的直观理解。
 func classifyHops(hops []string) (name, tier, hop string) {
-	for _, rule := range backboneRules {
-		for _, h := range hops {
+	for _, h := range hops {
+		if isInternationalLeg(h) {
+			continue
+		}
+		for _, rule := range backboneRules {
 			if strings.HasPrefix(h, rule.prefix) {
 				return rule.name, rule.tier, h
 			}
 		}
 	}
 	return "未知", "unknown", ""
+}
+
+func isInternationalLeg(ip string) bool {
+	for _, p := range backboneSkip {
+		if strings.HasPrefix(ip, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // traceroute 依次尝试 traceroute 与 mtr，返回路径上的跳 IP。

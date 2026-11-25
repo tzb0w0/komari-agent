@@ -42,6 +42,10 @@ var (
 
 	cached    RetransmitReport // 最近一次窗口结算结果
 	hasCached bool
+
+	// 首次结算用较短窗口，让面板尽快出数；之后按配置周期滚动
+	retransWarmupWindow = 5 * time.Minute
+	warmedUp            bool
 )
 
 // SetRetransmitInterval 设置重传采样窗口（<=0 时忽略）。
@@ -73,7 +77,11 @@ func CollectRetransmit() RetransmitReport {
 		return RetransmitReport{Available: false}
 	}
 
-	if now.Sub(windowStart) < retransWindow {
+	effectiveWindow := retransWindow
+	if !warmedUp {
+		effectiveWindow = retransWarmupWindow
+	}
+	if now.Sub(windowStart) < effectiveWindow {
 		// 窗口未满：返回上次结算结果
 		if hasCached {
 			return cached
@@ -97,6 +105,7 @@ func CollectRetransmit() RetransmitReport {
 	// 本窗口结束，起点推进到当前采样
 	windowStart, startRetransSeg, startOutSegs = now, curRetrans, curOut
 	cached, hasCached = report, true
+	warmedUp = true
 	return report
 }
 
