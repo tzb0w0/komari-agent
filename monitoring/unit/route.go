@@ -51,12 +51,16 @@ var backboneRules = []struct {
 }{
 	{"59.43.", "CN2 GIA", "premium"},
 	{"218.30.", "9929", "premium"},
-	{"202.97.", "163", "standard"},
 	{"219.158.", "169", "standard"},
+	{"202.97.", "163", "standard"},
+	{"223.119.", "CMI", "standard"},
 	{"223.120.", "CMI", "standard"},
 	{"221.176.", "移动骨干", "standard"},
+	{"221.179.", "移动骨干", "standard"},
 	{"211.136.", "移动城域", "standard"},
+	{"211.139.", "移动城域", "standard"},
 	{"112.96.", "联通城域", "standard"},
+	{"123.125.", "联通城域", "standard"},
 	{"61.152.", "电信城域", "standard"},
 	{"58.60.", "电信城域", "standard"},
 }
@@ -148,7 +152,14 @@ func probeRoute(carrier, target string) RouteInfo {
 		return info
 	}
 
-	info.Name, info.Tier, info.Hops = classifyHops(hops)
+	name, tier, hop := classifyHops(hops)
+	info.Name, info.Tier = name, tier
+	if hop != "" {
+		info.Hops = hop
+	} else if len(hops) > 0 {
+		// 未命中已知骨干：记录最后一跳，界面上可据此核对确实探测过
+		info.Hops = hops[len(hops)-1]
+	}
 	return info
 }
 
