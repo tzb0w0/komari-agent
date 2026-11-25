@@ -26,21 +26,75 @@ import (
 
 // RouteInfo 是单条回程线路的探测结果。
 type RouteInfo struct {
-	Carrier string `json:"carrier"` // 电信 / 联通 / 移动
-	Target  string `json:"target"`  // 探测目标 IP
-	Name    string `json:"name"`    // CN2 GIA / 9929 / 163 / 169 / CMI / 未知
-	Tier    string `json:"tier"`    // premium(精品) / standard(普通) / unknown
-	Hops    string `json:"hops"`    // 命中的关键节点（便于核对）
+	TaskID  uint   `json:"task_id,omitempty"` // 对应后台监控任务 ID
+	Carrier string `json:"carrier"`           // 电信 / 联通 / 移动
+	Target  string `json:"target"`            // 探测目标 IP
+	Name    string `json:"name"`              // CN2 GIA / 9929 / 163 / 169 / CMI / 未知
+	Tier    string `json:"tier"`              // premium(精品) / standard(普通) / unknown
+	Hops    string `json:"hops"`              // 命中的关键节点（便于核对）
 }
 
-// routeTargets 是三网回程探测目标：各省会运营商的 DNS/接入点。
-var routeTargets = []struct {
+// defaultRouteTargets 仅在还没收到任何监控任务时用于兜底探测。
+var defaultRouteTargets = []routeTarget{
+	{0, "电信", "202.96.209.133"},
+	{0, "联通", "210.22.70.3"},
+	{0, "移动", "211.136.192.6"},
+}
+
+type routeTarget struct {
+	taskID  uint
 	carrier string
 	target  string
-}{
-	{"电信", "202.96.209.133"},
-	{"联通", "210.22.70.3"},
-	{"移动", "211.136.192.6"},
+}
+
+// monitoredTargets 保存后台下发的监控目标（taskID -> 目标 IP），
+// 回程探测优先使用这些目标，保证「测的就是你在监控的那条线」。
+var (
+	monitoredMu      sync.RWMutex
+	monitoredTargets = map[uint]string{}
+	monitoredOrder   []uint
+)
+
+// SetRouteTarget 记录一个后台监控任务的目标地址（由 agent.ping 事件带入）。
+func SetRouteTarget(taskID uint, target string) {
+	target = strings.TrimSpace(target)
+	if taskID == 0 || target == "" {
+		return
+	}
+	monitoredMu.Lock()
+	_, existed := monitoredTargets[taskID]
+	monitoredTargets[taskID] = target
+	if !existed {
+		monitoredOrder = append(monitoredOrder, taskID)
+		// 目标过多会拖长探测时间，只保留最近写入的若干个
+		const maxMonitoredTargets = 6
+		if len(monitoredOrder) > maxMonitoredTargets {
+			drop := monitoredOrder[0]
+			delete(monitoredTargets, drop)
+			monitoredOrder = monitoredOrder[1:]
+		}
+		// 目标集合变化，立即重测一次，不必等 24 小时
+		routeCacheMu.Lock()
+		routeCacheAt = time.Time{}
+		routeCacheMu.Unlock()
+	}
+	monitoredMu.Unlock()
+}
+
+// currentRouteTargets 返回本轮要探测的目标：优先用后台监控目标。
+func currentRouteTargets() []routeTarget {
+	monitoredMu.RLock()
+	defer monitoredMu.RUnlock()
+	if len(monitoredOrder) == 0 {
+		return defaultRouteTargets
+	}
+	out := make([]routeTarget, 0, len(monitoredOrder))
+	for _, id := range monitoredOrder {
+		if ip := monitoredTargets[id]; ip != "" {
+			out = append(out, routeTarget{taskID: id, target: ip})
+		}
+	}
+	return out
 }
 
 // backboneRules 按优先级排列：越靠前越优先命中。
@@ -112,13 +166,14 @@ func GetRoutes() []RouteInfo {
 }
 
 func refreshRoutes() {
-	results := make([]RouteInfo, 0, len(routeTargets))
+	targets := currentRouteTargets()
+	results := make([]RouteInfo, 0, len(targets))
 
 	// 没有 traceroute/mtr 时直接给出明确结论，避免界面一直显示「探测中」
 	if !hasTraceroute() {
-		for _, t := range routeTargets {
+		for _, t := range targets {
 			results = append(results, RouteInfo{
-				Carrier: t.carrier, Target: t.target,
+				TaskID: t.taskID, Carrier: t.carrier, Target: t.target,
 				Name: "未安装 traceroute", Tier: "unknown",
 			})
 		}
@@ -130,13 +185,15 @@ func refreshRoutes() {
 		return
 	}
 
-	ch := make(chan RouteInfo, len(routeTargets))
-	for _, t := range routeTargets {
-		go func(carrier, target string) {
-			ch <- probeRoute(carrier, target)
-		}(t.carrier, t.target)
+	ch := make(chan RouteInfo, len(targets))
+	for _, t := range targets {
+		go func(taskID uint, carrier, target string) {
+			info := probeRoute(carrier, target)
+			info.TaskID = taskID
+			ch <- info
+		}(t.taskID, t.carrier, t.target)
 	}
-	for i := 0; i < len(routeTargets); i++ {
+	for i := 0; i < len(targets); i++ {
 		results = append(results, <-ch)
 	}
 

@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/komari-monitor/komari-agent/dnsresolver"
 	"github.com/komari-monitor/komari-agent/monitoring"
+	unit "github.com/komari-monitor/komari-agent/monitoring/unit"
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 	"github.com/komari-monitor/komari-agent/terminal"
 	"github.com/komari-monitor/komari-agent/utils"
@@ -24,9 +25,9 @@ import (
 )
 
 var (
-	v2AckMu       sync.Mutex
-	v2AckEventIDs []string
-	v2SeenEvents  = make(map[string]time.Time)
+	v2AckMu        sync.Mutex
+	v2AckEventIDs  []string
+	v2SeenEvents   = make(map[string]time.Time)
 	terminalDialMu sync.Mutex
 	terminalDials  = make(map[string]struct{})
 )
@@ -390,6 +391,8 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 			Target string `json:"ping_target"`
 		}
 		if err := v2.BindParams(params, &p); err == nil {
+			// 记录后台监控目标，回程线路探测就用这些地址，保证「测的就是你监控的」
+			unit.SetRouteTarget(p.TaskID, p.Target)
 			go NewPingTask(conn, p.TaskID, p.Type, p.Target)
 			return true
 		} else {
