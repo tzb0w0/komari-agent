@@ -36,9 +36,9 @@ func TestClassifyHops(t *testing.T) {
 			"CN2 GIA", "premium",
 		},
 		{
-			"只有城域节点",
+			"只有城域节点时不做线路命名",
 			[]string{"210.14.1.1"},
-			"联通", "standard",
+			"未知", "unknown",
 		},
 		{
 			"未知路径",

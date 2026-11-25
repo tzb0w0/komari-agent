@@ -17,8 +17,11 @@ package monitoring
 
 import (
 	"context"
+	"encoding/json"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -66,11 +69,13 @@ func SetRouteTarget(taskID uint, target, pingType string) {
 	if taskID == 0 || host == "" {
 		return
 	}
-	monitoredMu.Lock()
-	_, existed := monitoredTargets[taskID]
-	monitoredTargets[taskID] = routeTarget{
+	next := routeTarget{
 		taskID: taskID, host: host, port: port, typ: strings.ToLower(pingType),
 	}
+
+	monitoredMu.Lock()
+	prev, existed := monitoredTargets[taskID]
+	monitoredTargets[taskID] = next
 	if !existed {
 		monitoredOrder = append(monitoredOrder, taskID)
 		// 目标过多会拖长探测时间，只保留最近写入的若干个
@@ -80,12 +85,13 @@ func SetRouteTarget(taskID uint, target, pingType string) {
 			delete(monitoredTargets, drop)
 			monitoredOrder = monitoredOrder[1:]
 		}
-		// 目标集合变化，立即重测一次，不必等 24 小时
-		routeCacheMu.Lock()
-		routeCacheAt = time.Time{}
-		routeCacheMu.Unlock()
 	}
 	monitoredMu.Unlock()
+
+	// 只有地址/端口/类型真的变了才重测；单纯重复下发（每轮 ping 都会带）不触发
+	if !existed || prev.host != next.host || prev.port != next.port || prev.typ != next.typ {
+		scheduleRouteRefresh()
+	}
 }
 
 // currentRouteTargets 返回本轮要探测的目标：优先用后台监控目标。
@@ -110,7 +116,8 @@ var backboneRules = []struct {
 	name   string
 	tier   string
 }{
-	// 顺序即「同一跳内」的匹配优先级；跨跳时以路径先后为准（先入境内地骨干者胜）
+	// 只保留「产品级」线路名；城域节点（210.14/211.136 等）不算线路，
+	// 命中不了就显示「未知」并在 tooltip 里给出末跳，避免把城市骨干误标成线路。
 	{"59.43.", "CN2 GIA", "premium"},  // AS4809 电信 CN2 GIA
 	{"218.105.", "9929", "premium"},   // AS9929 联通 CUII
 	{"218.30.", "9929", "premium"},    // AS9929 国际段
@@ -121,10 +128,6 @@ var backboneRules = []struct {
 	{"113.96.", "163", "standard"},    // AS4134 广东电信
 	{"221.183.", "CMNET", "standard"}, // AS9808 移动 CMNET
 	{"111.24.", "CMNET", "standard"},  // AS9808 移动 CMNET
-	{"120.198.", "移动", "standard"},    // AS56040 广东移动
-	{"211.136.", "移动", "standard"},    // AS56040 广东移动
-	{"211.139.", "移动", "standard"},    // AS56040 广东移动
-	{"210.14.", "联通", "standard"},     // CNC-BACKBONE 城域
 }
 
 // backboneSkip 是国际段前缀：看到它们说明还没进入内地骨干，继续看下一跳
@@ -139,7 +142,19 @@ var (
 	hopLineRe     = regexp.MustCompile(`^\s*(\d+)\s+([0-9a-fA-F:.]+)`)
 	maxRouteHops  = "18"
 	routeProbeTmo = 45 * time.Second
+
+	// 目标变化后的去抖与最小间隔：避免一条条下发任务时连续重测
+	routeDirty    bool
+	routeTimer    *time.Timer
+	routeDebounce = 90 * time.Second
+	routeMinGap   = 10 * time.Minute
 )
+
+// routeState 是落盘的探测结果，保证重启后 24 小时内不再重测。
+type routeState struct {
+	ProbedAt time.Time   `json:"probed_at"`
+	Results  []RouteInfo `json:"results"`
+}
 
 // SetRouteInterval 设置回程路由探测周期（<=0 忽略）。
 func SetRouteInterval(d time.Duration) {
@@ -153,7 +168,10 @@ func SetRouteInterval(d time.Duration) {
 
 // GetRoutes 返回缓存的回程路由结果，必要时触发一次后台刷新。
 // 首次调用返回空数组（探测在后台进行），不阻塞调用方。
+var routeStateOnce sync.Once
+
 func GetRoutes() []RouteInfo {
+	routeStateOnce.Do(loadRouteState)
 	routeCacheMu.Lock()
 	cached := routeCache
 	stale := time.Since(routeCacheAt) >= routeTTL || routeCacheAt.IsZero()
@@ -209,6 +227,7 @@ func refreshRoutes() {
 	routeCacheAt = time.Now()
 	routeRunning = false
 	routeCacheMu.Unlock()
+	saveRouteState()
 }
 
 // probeRoute 对单个目标做 traceroute 并归类。
@@ -330,4 +349,75 @@ func splitHostPort(raw string) (string, int) {
 		return host, port
 	}
 	return raw, 0
+}
+
+// scheduleRouteRefresh 在目标变化后安排一次去抖刷新。
+func scheduleRouteRefresh() {
+	routeCacheMu.Lock()
+	routeDirty = true
+	if routeTimer == nil {
+		routeTimer = time.AfterFunc(routeDebounce, func() {
+			routeCacheMu.Lock()
+			routeTimer = nil
+			dirty := routeDirty
+			last := routeCacheAt
+			running := routeRunning
+			routeCacheMu.Unlock()
+
+			if !dirty || running {
+				return
+			}
+			// 距上次探测太近就跳过，等下一个 24 小时周期
+			if !last.IsZero() && time.Since(last) < routeMinGap {
+				return
+			}
+			refreshRoutes()
+		})
+	}
+	routeCacheMu.Unlock()
+}
+
+func routeStatePath() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(exe), "route-cache.json")
+}
+
+func loadRouteState() {
+	p := routeStatePath()
+	if p == "" {
+		return
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var st routeState
+	if err := json.Unmarshal(data, &st); err != nil || len(st.Results) == 0 {
+		return
+	}
+	if time.Since(st.ProbedAt) >= routeTTL {
+		return
+	}
+	routeCacheMu.Lock()
+	routeCache = st.Results
+	routeCacheAt = st.ProbedAt
+	routeCacheMu.Unlock()
+}
+
+func saveRouteState() {
+	p := routeStatePath()
+	if p == "" {
+		return
+	}
+	routeCacheMu.Lock()
+	st := routeState{ProbedAt: routeCacheAt, Results: routeCache}
+	routeCacheMu.Unlock()
+	data, err := json.Marshal(st)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(p, data, 0o644)
 }
