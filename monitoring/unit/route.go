@@ -64,7 +64,9 @@ var (
 
 // SetRouteTarget 记录一个后台监控任务的目标（由 agent.ping 事件带入）。
 // target 可能是 1.2.3.4、host、host:80 甚至 [v6]:443，这里统一拆成 host + port。
-func SetRouteTarget(taskID uint, target, pingType string) {
+// taskName 是后台填写的任务名（如「广东电信」），用于判断目的运营商：
+// 同样的路径前缀，对电信目标和对联通目标代表的线路完全不同。
+func SetRouteTarget(taskID uint, taskName, target, pingType string) {
 	// 先恢复落盘的探测结果，让重启后的首屏不至于空白。
 	// 注意：loadRouteState 只恢复结果、不恢复探测时间，本进程仍会重新检测一次。
 	routeStateOnce.Do(loadRouteState)
@@ -73,7 +75,8 @@ func SetRouteTarget(taskID uint, target, pingType string) {
 		return
 	}
 	next := routeTarget{
-		taskID: taskID, host: host, port: port, typ: strings.ToLower(pingType),
+		taskID: taskID, carrier: carrierFromName(taskName),
+		host: host, port: port, typ: strings.ToLower(pingType),
 	}
 
 	monitoredMu.Lock()
@@ -99,6 +102,30 @@ func SetRouteTarget(taskID uint, target, pingType string) {
 	}
 }
 
+// carrierFromName 从后台任务名里推断目的运营商，识别不出时返回空串，
+// 此时判定退化为「路径上第一个骨干节点」。
+func carrierFromName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch {
+	case hasAny(n, "电信", "telecom", "ctcc", "chinanet"):
+		return "电信"
+	case hasAny(n, "联通", "unicom", "cucc", "china169"):
+		return "联通"
+	case hasAny(n, "移动", "mobile", "cmcc"):
+		return "移动"
+	}
+	return ""
+}
+
+func hasAny(s string, subs ...string) bool {
+	for _, sub := range subs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // currentRouteTargets 返回本轮要探测的目标：优先用后台监控目标。
 func currentRouteTargets() []routeTarget {
 	monitoredMu.RLock()
@@ -115,28 +142,46 @@ func currentRouteTargets() []routeTarget {
 	return out
 }
 
-// backboneRules 按优先级排列：越靠前越优先命中。
-var backboneRules = []struct {
-	prefix string
-	name   string
-	tier   string
-}{
-	// 只保留「产品级」线路名；城域节点（210.14/211.136 等）不算线路，
-	// 命中不了就显示「未知」并在 tooltip 里给出末跳，避免把城市骨干误标成线路。
-	{"59.43.", "CN2 GIA", "premium"},  // AS4809 电信 CN2 GIA
-	{"218.105.", "9929", "premium"},   // AS9929 联通 CUII
-	{"218.30.", "9929", "premium"},    // AS9929 国际段
-	{"223.119.", "CMIN2", "premium"},  // AS58807 移动 CMIN2
-	{"223.120.", "CMIN2", "premium"},  // AS58807 移动 CMIN2
-	{"219.158.", "169", "standard"},   // AS4837 联通 169 骨干
-	{"202.97.", "163", "standard"},    // AS4134 电信 163 骨干
-	{"113.96.", "163", "standard"},    // AS4134 广东电信
-	{"221.183.", "CMNET", "standard"}, // AS9808 移动 CMNET
-	{"111.24.", "CMNET", "standard"},  // AS9808 移动 CMNET
+// backboneRule 描述一条骨干线路的识别特征。
+// carrier 用于「按目的运营商取线」：优先取目标运营商自己网络里最先出现的那一跳。
+type backboneRule struct {
+	prefix  string
+	name    string
+	tier    string
+	carrier string // 电信 / 联通 / 移动
 }
 
-// backboneSkip 是国际段前缀：看到它们说明还没进入内地骨干，继续看下一跳
-var backboneSkip = []string{"162.219.", "43.255.", "203.160."}
+// backboneRules 是线路识别表，前缀归属全部按运营商真实分配：
+//
+//	电信 163(AS4134)      202.97. / 113.96.
+//	电信 CN2(AS4809)      59.43.
+//	联通 9929/CUII        218.105. / 210.51.
+//	联通 169(AS4837)      219.158.
+//	移动 CMI(AS58453)     223.120.
+//	移动 CMIN2(AS58807)   223.118. / 223.119.
+//	移动 CMNET(AS9808)    221.176. / 221.183. / 111.24.
+//
+// 只保留「产品级」线路名；城域节点（210.14/211.136 等）不算线路，
+// 命中不了就显示「未知」并在 tooltip 里给出末跳，避免把城市骨干误标成线路。
+var backboneRules = []backboneRule{
+	{"59.43.", "CN2 GIA", "premium", "电信"},  // AS4809 电信 CN2 GIA
+	{"113.96.", "163", "standard", "电信"},     // AS4134 广东电信
+	{"202.97.", "163", "standard", "电信"},     // AS4134 电信 163 骨干
+	{"218.105.", "9929", "premium", "联通"},   // AS9929 联通 CUII
+	{"210.51.", "9929", "premium", "联通"},    // AS9929 联通 CUII
+	{"219.158.", "169", "standard", "联通"},   // AS4837 联通 169 骨干
+	{"223.118.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
+	{"223.119.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
+	{"223.120.", "CMI", "standard", "移动"},   // AS58453 移动 CMI（普通国际出口）
+	{"221.176.", "CMNET", "standard", "移动"}, // AS9808 移动 CMNET
+	{"221.183.", "CMNET", "standard", "移动"}, // AS9808 移动 CMNET
+	{"111.24.", "CMNET", "standard", "移动"},  // AS9808 移动 CMNET
+}
+
+// backboneSkip 是国际段前缀：看到它们说明还没进入内地骨干，继续看下一跳。
+// 218.30.x.x 属于中国电信 ChinaNet 国际出口（AS4835），
+// 它既不是 9929 也不是任何产品线，必须跳过，否则整条电信回程会被误标成 9929。
+var backboneSkip = []string{"218.30.", "162.219.", "43.255.", "203.160."}
 
 var (
 	routeCache    []RouteInfo
@@ -145,6 +190,8 @@ var (
 	routeRunning  bool
 	routeTTL      = 24 * time.Hour
 	hopLineRe     = regexp.MustCompile(`^\s*(\d+)\s+([0-9a-fA-F:.]+)`)
+	// mtr -r -n 的行格式是 ` 1.|-- 1.2.3.4 ...`，与 traceroute 不同
+	mtrLineRe = regexp.MustCompile(`^\s*(\d+)\.\|--\s+([0-9a-fA-F:.]+)`)
 	maxRouteHops  = "18"
 	routeProbeTmo = 45 * time.Second
 
@@ -160,7 +207,7 @@ var (
 
 // routeStateVersion 标识缓存格式；旧版本缓存（可能含运营商名 / ASN 等
 // 非线路名的脏数据）一律丢弃，等本进程重新探测后再落盘。
-const routeStateVersion = 2
+const routeStateVersion = 3
 
 // routeState 是落盘的探测结果，保证重启后首屏不至于空白。
 type routeState struct {
@@ -264,7 +311,7 @@ func probeRoute(carrier, host string, port int, pingType string) RouteInfo {
 		return info
 	}
 
-	name, tier, hop := classifyHops(hops)
+	name, tier, hop := classifyHops(hops, carrier)
 	info.Name, info.Tier = name, tier
 	if hop != "" {
 		info.Hops = hop
@@ -275,18 +322,41 @@ func probeRoute(carrier, host string, port int, pingType string) RouteInfo {
 	return info
 }
 
-// classifyHops 按「路径先后」判定：第一个进入内地骨干的节点决定线路类型。
-// 这与 nexttrace 的 “-> ASxxxx” 语义一致，也符合回程测试的直观理解。
-func classifyHops(hops []string) (name, tier, hop string) {
+// classifyHops 判定回程线路。
+//
+// 关键点：不能简单取「路径上第一个骨干节点」。跨境回程经常先经过另一家运营商的
+// 网络再落地，例如电信目标常见的 CUG -> 9929 -> 202.97，若取第一个命中就会把
+// 电信 163 错标成联通 9929。因此优先取「目标运营商自己网络里最先出现的那一跳」，
+// 这一跳才是真正把流量送进目的运营商的线路；运营商未知时退化为第一个命中。
+func classifyHops(hops []string, preferCarrier string) (name, tier, hop string) {
+	var first, preferred *backboneRule
+	var firstHop, preferredHop string
 	for _, h := range hops {
 		if isInternationalLeg(h) {
 			continue
 		}
-		for _, rule := range backboneRules {
-			if strings.HasPrefix(h, rule.prefix) {
-				return rule.name, rule.tier, h
+		for i := range backboneRules {
+			rule := &backboneRules[i]
+			if !strings.HasPrefix(h, rule.prefix) {
+				continue
 			}
+			if first == nil {
+				first, firstHop = rule, h
+			}
+			if preferred == nil && preferCarrier != "" && rule.carrier == preferCarrier {
+				preferred, preferredHop = rule, h
+			}
+			break
 		}
+		if preferred != nil {
+			break
+		}
+	}
+	if preferred != nil {
+		return preferred.name, preferred.tier, preferredHop
+	}
+	if first != nil {
+		return first.name, first.tier, firstHop
 	}
 	return "未知", "unknown", ""
 }
@@ -336,6 +406,9 @@ func parseHops(out string) []string {
 	var hops []string
 	for _, line := range strings.Split(out, "\n") {
 		m := hopLineRe.FindStringSubmatch(line)
+		if len(m) < 3 {
+			m = mtrLineRe.FindStringSubmatch(line)
+		}
 		if len(m) < 3 {
 			continue
 		}

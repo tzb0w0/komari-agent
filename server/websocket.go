@@ -373,12 +373,13 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 	case v2.MethodAgentPing:
 		var p struct {
 			TaskID uint   `json:"ping_task_id"`
+			Name   string `json:"ping_task_name"`
 			Type   string `json:"ping_type"`
 			Target string `json:"ping_target"`
 		}
 		if err := v2.BindParams(params, &p); err == nil {
 			// 记录后台监控目标，回程线路探测就用这些地址，保证「测的就是你监控的」
-			unit.SetRouteTarget(p.TaskID, p.Target, p.Type)
+			unit.SetRouteTarget(p.TaskID, p.Name, p.Target, p.Type)
 			go NewPingTask(conn, p.TaskID, p.Type, p.Target)
 			return true
 		} else {
