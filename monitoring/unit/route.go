@@ -18,6 +18,7 @@ package monitoring
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -85,7 +86,7 @@ func SetRouteTarget(taskID uint, taskName, target, pingType string) {
 	if !existed {
 		monitoredOrder = append(monitoredOrder, taskID)
 		// 目标过多会拖长探测时间，只保留最近写入的若干个
-		const maxMonitoredTargets = 6
+		const maxMonitoredTargets = 12
 		if len(monitoredOrder) > maxMonitoredTargets {
 			drop := monitoredOrder[0]
 			delete(monitoredTargets, drop)
@@ -192,7 +193,7 @@ var (
 	hopLineRe     = regexp.MustCompile(`^\s*(\d+)\s+([0-9a-fA-F:.]+)`)
 	// mtr -r -n 的行格式是 ` 1.|-- 1.2.3.4 ...`，与 traceroute 不同
 	mtrLineRe = regexp.MustCompile(`^\s*(\d+)\.\|--\s+([0-9a-fA-F:.]+)`)
-	maxRouteHops  = "18"
+	maxRouteHops  = "20"
 	routeProbeTmo = 45 * time.Second
 
 	// 目标变化后的去抖与最小间隔：避免一条条下发任务时连续重测
@@ -207,7 +208,7 @@ var (
 
 // routeStateVersion 标识缓存格式；旧版本缓存（可能含运营商名 / ASN 等
 // 非线路名的脏数据）一律丢弃，等本进程重新探测后再落盘。
-const routeStateVersion = 3
+const routeStateVersion = 4
 
 // routeState 是落盘的探测结果，保证重启后首屏不至于空白。
 type routeState struct {
@@ -311,52 +312,58 @@ func probeRoute(carrier, host string, port int, pingType string) RouteInfo {
 		return info
 	}
 
-	name, tier, hop := classifyHops(hops, carrier)
+	name, tier, hop := classifyHops(hops)
 	info.Name, info.Tier = name, tier
-	if hop != "" {
-		info.Hops = hop
-	} else if len(hops) > 0 {
-		// 未命中已知骨干：记录最后一跳，界面上可据此核对确实探测过
-		info.Hops = hops[len(hops)-1]
-	}
+	// 把「落地跳及其前几跳」一起上报，面板 tooltip 直接可见，
+	// 出现偏差时用户不用猜、也不需要再跑 nq 就能核对
+	info.Hops = pathSummary(hops, hop)
 	return info
 }
 
-// classifyHops 判定回程线路。
+// pathSummary 生成用于人工核对的路径片段：落地跳 + 它前面最多 3 跳。
+func pathSummary(hops []string, matched string) string {
+	if len(hops) == 0 {
+		return ""
+	}
+	idx := len(hops) - 1
+	if matched != "" {
+		for i, h := range hops {
+			if h == matched {
+				idx = i
+				break
+			}
+		}
+	}
+	start := idx - 3
+	if start < 0 {
+		start = 0
+	}
+	return fmt.Sprintf("%s（第%d跳/共%d跳）",
+		strings.Join(hops[start:idx+1], " → "), idx+1, len(hops))
+}
+
+// classifyHops 判定回程线路：只看「跨境落地那一跳」。
 //
-// 关键点：不能简单取「路径上第一个骨干节点」。跨境回程经常先经过另一家运营商的
-// 网络再落地，例如电信目标常见的 CUG -> 9929 -> 202.97，若取第一个命中就会把
-// 电信 163 错标成联通 9929。因此优先取「目标运营商自己网络里最先出现的那一跳」，
-// 这一跳才是真正把流量送进目的运营商的线路；运营商未知时退化为第一个命中。
-func classifyHops(hops []string, preferCarrier string) (name, tier, hop string) {
-	var first, preferred *backboneRule
-	var firstHop, preferredHop string
+// 这是行业通行口径，也是用户明确要求的：从本机 traceroute 国内目标，
+// 第一个进入中国大陆骨干网的节点，就是这段回程的入境线路。
+// 例如 ... -> 218.30.x（电信国际出口，仍属境外段）-> 202.97.x -> 目标，
+// 落地跳是 202.97，线路即 163。
+//
+// 注意：
+//   - 不能按「目的运营商」去翻后面的跳，那会把中转段误当成线路；
+//   - 必须先跳过国际出口段（218.30 等），它们不是产品线；
+//   - 取第一个命中即可，后面的跳只代表国内落地后的省内走向。
+func classifyHops(hops []string) (name, tier, hop string) {
 	for _, h := range hops {
 		if isInternationalLeg(h) {
 			continue
 		}
 		for i := range backboneRules {
 			rule := &backboneRules[i]
-			if !strings.HasPrefix(h, rule.prefix) {
-				continue
+			if strings.HasPrefix(h, rule.prefix) {
+				return rule.name, rule.tier, h
 			}
-			if first == nil {
-				first, firstHop = rule, h
-			}
-			if preferred == nil && preferCarrier != "" && rule.carrier == preferCarrier {
-				preferred, preferredHop = rule, h
-			}
-			break
 		}
-		if preferred != nil {
-			break
-		}
-	}
-	if preferred != nil {
-		return preferred.name, preferred.tier, preferredHop
-	}
-	if first != nil {
-		return first.name, first.tier, firstHop
 	}
 	return "未知", "unknown", ""
 }
@@ -376,13 +383,13 @@ func traceroute(target string, port int, tcp bool) ([]string, error) {
 	if tcp && port > 0 {
 		commands = append(commands, []string{
 			"traceroute", "-n", "-T", "-p", strconv.Itoa(port),
-			"-m", maxRouteHops, "-q", "1", "-w", "2", target,
+			"-m", maxRouteHops, "-q", "3", "-w", "3", target,
 		})
 	}
 	commands = append(commands,
-		[]string{"traceroute", "-n", "-m", maxRouteHops, "-q", "1", "-w", "2", target},
-		[]string{"traceroute", "-n", "-I", "-m", maxRouteHops, "-q", "1", "-w", "2", target},
-		[]string{"mtr", "-r", "-n", "-c", "1", "-m", maxRouteHops, target},
+		[]string{"traceroute", "-n", "-m", maxRouteHops, "-q", "3", "-w", "3", target},
+		[]string{"traceroute", "-n", "-I", "-m", maxRouteHops, "-q", "3", "-w", "3", target},
+		[]string{"mtr", "-r", "-n", "-c", "2", "-m", maxRouteHops, target},
 	)
 	var lastErr error
 	for _, argv := range commands {
