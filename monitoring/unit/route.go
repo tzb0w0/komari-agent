@@ -32,12 +32,14 @@ import (
 
 // RouteInfo 是单条回程线路的探测结果。
 type RouteInfo struct {
-	TaskID  uint   `json:"task_id,omitempty"` // 对应后台监控任务 ID
-	Carrier string `json:"carrier"`           // 电信 / 联通 / 移动
-	Target  string `json:"target"`            // 探测目标 IP
-	Name    string `json:"name"`              // CN2 GIA / 9929 / 163 / 169 / CMI / 未知
-	Tier    string `json:"tier"`              // premium(精品) / standard(普通) / unknown
-	Hops    string `json:"hops"`              // 命中的关键节点（便于核对）
+	TaskID   uint   `json:"task_id,omitempty"`  // 对应后台监控任务 ID
+	Carrier  string `json:"carrier"`            // 目标运营商（后台任务名推断）：电信 / 联通 / 移动
+	Target   string `json:"target"`             // 探测目标 IP
+	Name     string `json:"name"`               // CN2 GIA / CN2 GT / 9929 / CMIN2 / 169 / CMI / 163 / CMNET / 未知
+	Tier     string `json:"tier"`               // premium(精品) / standard(普通) / unknown
+	Backbone string `json:"backbone,omitempty"` // 骨干网归属：电信 / 联通 / 移动
+	Cross    bool   `json:"cross,omitempty"`    // 目标运营商与骨干归属不一致（仅供数据侧参考，界面不显示）
+	Hops     string `json:"hops"`               // 命中的关键节点（便于核对）
 }
 
 // defaultRouteTargets 仅在还没收到任何监控任务时用于兜底探测。
@@ -143,56 +145,49 @@ func currentRouteTargets() []routeTarget {
 	return out
 }
 
-// backboneRule 描述一条骨干线路的识别特征。
-// carrier 用于「按目的运营商取线」：优先取目标运营商自己网络里最先出现的那一跳。
-type backboneRule struct {
-	prefix  string
-	name    string
-	tier    string
-	carrier string // 电信 / 联通 / 移动
-}
-
-// backboneRules 是「前缀兜底表」，只在拿不到 ASN 时使用（DNS 不可用）。
-// 主判据见 asnRules / classifyByLandingASN。
+// routeFeature 描述一条骨干线路的识别特征与展示信息。
 //
-//	电信 163(AS4134)      202.97. / 113.96. / 218.30.（国际段，落地仍属 163 网）
-//	电信 CN2(AS4809)      59.43.
-//	联通 9929/CUII        218.105. / 210.51.
-//	联通 169(AS4837)      219.158.
-//	移动 CMIN2(AS58807)   223.120. / 223.118. / 223.119.
-//	移动 CMNET(AS9808)    221.176. / 221.183. / 111.24.
-var backboneRules = []backboneRule{
-	{"59.43.", "CN2 GIA", "premium", "电信"},  // AS4809 电信 CN2 GIA
-	{"218.30.", "163", "standard", "电信"},    // AS4134 ChinaNet 国际段
-	{"202.97.", "163", "standard", "电信"},    // AS4134 电信 163 骨干
-	{"113.96.", "163", "standard", "电信"},    // AS4134 广东电信
-	{"218.105.", "9929", "premium", "联通"},   // AS9929 联通 CUII
-	{"210.51.", "9929", "premium", "联通"},    // AS9929 联通 CUII
-	{"219.158.", "169", "standard", "联通"},   // AS4837 联通 169 骨干
-	{"223.120.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
-	{"223.118.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
-	{"223.119.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
-	{"221.176.", "CMNET", "standard", "移动"}, // AS9808 移动 CMNET
-	{"221.183.", "CMNET", "standard", "移动"}, // AS9808 移动 CMNET
-	{"111.24.", "CMNET", "standard", "移动"},  // AS9808 移动 CMNET
+// 判定不看「落地 AS」，因为跨境路径的落地跳经常属于目标运营商自己的
+// ChinaNet / CMNET 网（AS4134 / AS9808），纯粹的 CN2 路径会被判成 163。
+// 这里改为「骨干网特征优先级匹配」：先看路径里出现了哪张骨干网，
+// 再按优先级取第一条命中——这才是回程线路的通行口径。
+type routeFeature struct {
+	name    string   // 面板徽章显示的线路名（界面只展示这一个值）
+	tier    string   // premium / standard / unknown
+	carrier string   // 骨干网归属运营商
+	prefix  []string // IP 前缀特征
+	asn     []int    // ASN 特征
 }
 
-// asnRules 是主判据：跨境落地跳的 ASN 决定线路。
-// 这是 nq / nexttrace 这类工具的口径，也是唯一能覆盖「跨网」的做法——
-// 电信目标可能落地在 AS9929（走 9929），联通目标可能落地在 AS4809（走 CN2），
-// 与监控行的运营商无关。
-var asnRules = map[int]backboneRule{
-	4134:  {"", "163", "standard", "电信"},    // ChinaNet 163
-	4809:  {"", "CN2 GIA", "premium", "电信"}, // CN2
-	9929:  {"", "9929", "premium", "联通"},    // CUII 联通 A 网
-	4837:  {"", "169", "standard", "联通"},    // China169
-	58807: {"", "CMIN2", "premium", "移动"},   // 移动精品国际网
-	58453: {"", "CMI", "standard", "移动"},    // 移动国际普通出口
-	9808:  {"", "CMNET", "standard", "移动"},  // 移动国内骨干
-}
+var (
+	// 规则 1 / 4：59.43 / AS4809 是 CN2，核心段是否混有 202.97 决定 GIA 还是 GT
+	featCN2GIA = routeFeature{"CN2 GIA", "premium", "电信", []string{"59.43."}, []int{4809}}
+	featCN2GT  = routeFeature{"CN2 GT", "standard", "电信", []string{"59.43."}, []int{4809}}
+
+	// 规则 2：联通 CUII。218.105 / 210.51 是 AS9929 的强特征；
+	// 210.14 只是联通城域骨干（169 路径也会经过），单独出现时降级为弱证据。
+	feat9929Strong = routeFeature{"9929", "premium", "联通", []string{"218.105.", "210.51."}, []int{9929}}
+	feat9929       = routeFeature{"9929", "premium", "联通", []string{"218.105.", "210.51.", "210.14."}, []int{9929}}
+
+	// 规则 3：移动 CMIN2
+	featCMIN2 = routeFeature{"CMIN2", "premium", "移动", []string{"223.120."}, []int{58807}}
+
+	// 规则 5：联通 169
+	feat169 = routeFeature{"169", "standard", "联通", []string{"219.158."}, []int{4837}}
+
+	// 规则 6：移动 CMI 普通国际出口
+	featCMI = routeFeature{"CMI", "standard", "移动", []string{"223.118.", "223.119."}, []int{58453}}
+
+	// 规则 7：电信 163
+	feat163 = routeFeature{"163", "standard", "电信", []string{"202.97.", "218.30.", "113.96."}, []int{4134}}
+
+	// 规则 8（规则表外的兜底）：移动 CMNET 国内骨干，
+	// 不加这条则普通移动回程会全部变「未知」，信息量反而下降。
+	featCMNET = routeFeature{"CMNET", "standard", "移动", []string{"221.176.", "221.183.", "111.24."}, []int{9808}}
+)
 
 // backboneSkip 是纯国际段前缀（联通 CUG、电信 CTG 等），不代表回国线路，
-// 仅在前缀兜底时跳过。
+// 只在没有 ASN 信息时用于跳过境外跳。
 var backboneSkip = []string{"162.219.", "43.255.", "203.160."}
 
 var (
@@ -219,7 +214,7 @@ var (
 
 // routeStateVersion 标识缓存格式；旧版本缓存（可能含运营商名 / ASN 等
 // 非线路名的脏数据）一律丢弃，等本进程重新探测后再落盘。
-const routeStateVersion = 5
+const routeStateVersion = 6
 
 // routeState 是落盘的探测结果，保证重启后首屏不至于空白。
 type routeState struct {
@@ -323,11 +318,13 @@ func probeRoute(carrier, host string, port int, pingType string) RouteInfo {
 		return info
 	}
 
-	name, tier, hop := classifyHops(hops)
-	info.Name, info.Tier = name, tier
-	// 把「落地跳及其前几跳」一起上报，面板 tooltip 直接可见，
+	c := classifyRoute(hops)
+	info.Name, info.Tier = c.name, c.tier
+	info.Backbone = c.carrier
+	info.Cross = carrier != "" && c.carrier != "" && carrier != c.carrier
+	// 把「命中跳及其前几跳」一起上报，面板 tooltip 直接可见，
 	// 出现偏差时用户不用猜、也不需要再跑 nq 就能核对
-	info.Hops = pathSummary(hops, hop)
+	info.Hops = pathSummary(hops, c.hop)
 	return info
 }
 
@@ -467,48 +464,175 @@ func lookupOriginASN(ip string) (int, string) {
 	return asn, strings.ToUpper(strings.TrimSpace(fields[2]))
 }
 
-// classifyHops 判定回程线路。
-//
-// 主判据是「跨境落地那一跳」的 ASN：路径上第一个位于中国大陆的跳，
-// 其 ASN 决定这段回程走哪张网——与监控行的运营商无关，允许跨网
-// （电信目标落地 AS9929 就是 9929，联通目标落地 AS4809 就是 CN2）。
-// 取不到 ASN 时才退回前缀表，避免 DNS 不可用时整块变「未知」。
-func classifyHops(hops []string) (name, tier, hop string) {
-	if name, tier, hop, ok := classifyByLandingASN(hops); ok {
-		return name, tier, hop
-	}
-	for _, h := range hops {
-		if isInternationalLeg(h) {
-			continue
+// routeClass 是单条目标的判定结果。
+type routeClass struct {
+	name, tier, carrier, hop string
+	matched                  bool
+}
+
+// hopFacts 是单跳的 ASN / 国家信息。
+type hopFacts struct {
+	ip     string
+	asn    int
+	cc     string
+	hasASN bool
+}
+
+func (f routeFeature) match(h hopFacts) bool {
+	for _, p := range f.prefix {
+		if strings.HasPrefix(h.ip, p) {
+			return true
 		}
-		for i := range backboneRules {
-			rule := &backboneRules[i]
-			if strings.HasPrefix(h, rule.prefix) {
-				return rule.name, rule.tier, h
+	}
+	if h.hasASN {
+		for _, a := range f.asn {
+			if h.asn == a {
+				return true
 			}
 		}
 	}
-	return "未知", "unknown", ""
+	return false
 }
 
-// classifyByLandingASN 找第一个落地中国大陆的跳，用它的 ASN 定线路。
-func classifyByLandingASN(hops []string) (name, tier, hop string, ok bool) {
+// collectHopFacts 逐跳查 ASN（有缓存，重复探测不会重复查询）。
+func collectHopFacts(hops []string) []hopFacts {
 	limit := len(hops)
-	if limit > 16 {
-		limit = 16 // 落地跳不会太靠后，限制查询次数
+	if limit > 20 {
+		limit = 20 // 落地跳不会太靠后，限制 DNS 查询次数
 	}
-	for i := 0; i < limit; i++ {
-		h := hops[i]
-		asn, cc, found := originASNCached(h)
-		if !found || cc != "CN" {
+	out := make([]hopFacts, 0, limit)
+	for _, ip := range hops[:limit] {
+		h := hopFacts{ip: ip}
+		if asn, cc, ok := originASNCached(ip); ok {
+			h.asn, h.cc, h.hasASN = asn, cc, true
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// coreStart 定位「核心段」起点：第一个位于中国大陆的跳。
+// 拿不到 ASN（DNS 不通）时退回到第一个命中骨干特征的跳，避免核心段判空。
+func coreStart(facts []hopFacts) int {
+	for i, h := range facts {
+		if h.hasASN && h.cc == "CN" {
+			return i
+		}
+	}
+	all := []routeFeature{featCN2GIA, feat9929, featCMIN2, feat169, featCMI, feat163, featCMNET}
+	for i, h := range facts {
+		if isInternationalLeg(h.ip) {
 			continue
 		}
-		if rule, hit := asnRules[asn]; hit {
-			return rule.name, rule.tier, h, true
+		for _, f := range all {
+			if f.match(h) {
+				return i
+			}
 		}
-		// 大陆境内但不在线路表（省级/地市 AS）：继续往后找已知骨干
 	}
-	return "", "", "", false
+	return 0
+}
+
+// coreHas163Backbone 判断核心段是否混有 202.97（163 骨干网）。
+// 只认 202.97 前缀：AS4134 还包含 113.96 等省级段，CN2 GIA 落地后同样会
+// 经过 AS4134，用 ASN 判断会把纯 GIA 误标成 GT。
+func coreHas163Backbone(core []hopFacts) bool {
+	for _, h := range core {
+		if strings.HasPrefix(h.ip, "202.97.") {
+			return true
+		}
+	}
+	return false
+}
+
+func firstHit(f routeFeature, facts []hopFacts) (bool, string) {
+	for _, h := range facts {
+		if f.match(h) {
+			return true, h.ip
+		}
+	}
+	return false, ""
+}
+
+func firstHitPrefix(facts []hopFacts, prefix string) (bool, string) {
+	for _, h := range facts {
+		if strings.HasPrefix(h.ip, prefix) {
+			return true, h.ip
+		}
+	}
+	return false, ""
+}
+
+func pick(f routeFeature, hop string) routeClass {
+	return routeClass{name: f.name, tier: f.tier, carrier: f.carrier, hop: hop, matched: true}
+}
+
+// classifyRoute 按「骨干网特征优先级」判定回程线路，顺序与需求口径一致：
+//
+//  1. 59.43 / AS4809，且核心段无 202.97   → CN2 GIA 优质
+//  2. 218.105 / 210.51 / 210.14 / AS9929 → 9929 优质
+//  3. 223.120 / AS58807                  → CMIN2 优质
+//  4. 59.43 / AS4809，核心段混有 202.97   → CN2 GT 半程优化
+//  5. 219.158 / AS4837                   → 169 普通
+//  6. 223.118 / 223.119 / AS58453        → CMI 普通
+//  7. 202.97 / AS4134                    → 163 普通
+//  8. 221.176 / 221.183 / 111.24 / AS9808 → CMNET 普通（兜底）
+//
+// 判定与目标运营商无关：电信目标回程走 9929 就判 9929，联通目标走
+// CN2 就判 CN2，跨网由 buildRouteLabel 标注，不强行归到本网。
+func classifyRoute(hops []string) routeClass {
+	if len(hops) == 0 {
+		return routeClass{name: "未知", tier: "unknown"}
+	}
+	facts := collectHopFacts(hops)
+	core := facts[coreStart(facts):]
+
+	// 规则 1 / 4：CN2。命中 59.43 后看核心段是否混有 202.97 区分 GIA / GT。
+	if ok, hop := firstHit(featCN2GIA, facts); ok {
+		if coreHas163Backbone(core) {
+			return pick(featCN2GT, hop)
+		}
+		return pick(featCN2GIA, hop)
+	}
+
+	// 规则 2：9929。强特征优先；210.14 单独出现时，只有在同路径没有
+	// 219.158（169 骨干）的情况下才认作 9929，否则会把握手走 169 的线路误标成精品。
+	if ok, hop := firstHit(feat9929Strong, facts); ok {
+		return pick(feat9929, hop)
+	}
+	if ok, hop := firstHitPrefix(facts, "210.14."); ok {
+		if has169, _ := firstHit(feat169, facts); !has169 {
+			return pick(feat9929, hop)
+		}
+	}
+
+	// 规则 3
+	if ok, hop := firstHit(featCMIN2, facts); ok {
+		return pick(featCMIN2, hop)
+	}
+	// 规则 5
+	if ok, hop := firstHit(feat169, facts); ok {
+		return pick(feat169, hop)
+	}
+	// 规则 6
+	if ok, hop := firstHit(featCMI, facts); ok {
+		return pick(featCMI, hop)
+	}
+	// 规则 7
+	if ok, hop := firstHit(feat163, facts); ok {
+		return pick(feat163, hop)
+	}
+	// 规则 8（兜底）
+	if ok, hop := firstHit(featCMNET, facts); ok {
+		return pick(featCMNET, hop)
+	}
+	return routeClass{name: "未知", tier: "unknown"}
+}
+
+// classifyHops 保留旧签名，供测试与调用方使用。
+func classifyHops(hops []string) (name, tier, hop string) {
+	c := classifyRoute(hops)
+	return c.name, c.tier, c.hop
 }
 
 func isInternationalLeg(ip string) bool {
