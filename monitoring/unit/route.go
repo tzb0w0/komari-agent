@@ -153,10 +153,18 @@ var (
 	routeTimer    *time.Timer
 	routeDebounce = 90 * time.Second
 	routeMinGap   = 10 * time.Minute
+
+	// routesUpdatedHook 在每轮回程探测完成后触发，用于把最新结果上报给面板。
+	routesUpdatedHook func()
 )
 
-// routeState 是落盘的探测结果，保证重启后 24 小时内不再重测。
+// routeStateVersion 标识缓存格式；旧版本缓存（可能含运营商名 / ASN 等
+// 非线路名的脏数据）一律丢弃，等本进程重新探测后再落盘。
+const routeStateVersion = 2
+
+// routeState 是落盘的探测结果，保证重启后首屏不至于空白。
 type routeState struct {
+	Version  int         `json:"version"`
 	ProbedAt time.Time   `json:"probed_at"`
 	Results  []RouteInfo `json:"results"`
 }
@@ -199,7 +207,12 @@ func refreshRoutes() {
 	defer func() {
 		routeCacheMu.Lock()
 		routeDirty = false
+		hook := routesUpdatedHook
 		routeCacheMu.Unlock()
+		// 探测结果落盘后主动刷新 basicInfo，避免面板一直显示启动时的旧快照
+		if hook != nil {
+			go hook()
+		}
 	}()
 	targets := currentRouteTargets()
 	results := make([]RouteInfo, 0, len(targets))
@@ -361,6 +374,14 @@ func splitHostPort(raw string) (string, int) {
 	return raw, 0
 }
 
+// SetRoutesUpdatedHook 注册每轮回程探测完成后的回调。
+// 由 server 包用于重新上报 basicInfo，让面板及时拿到最新线路结果。
+func SetRoutesUpdatedHook(fn func()) {
+	routeCacheMu.Lock()
+	routesUpdatedHook = fn
+	routeCacheMu.Unlock()
+}
+
 // scheduleRouteRefresh 在目标变化后安排一次去抖刷新。
 func scheduleRouteRefresh() {
 	routeCacheMu.Lock()
@@ -408,6 +429,10 @@ func loadRouteState() {
 	if err := json.Unmarshal(data, &st); err != nil || len(st.Results) == 0 {
 		return
 	}
+	// 旧格式缓存里可能混有运营商名 / ASN 之类的无效线路名，直接丢弃
+	if st.Version != routeStateVersion {
+		return
+	}
 	if time.Since(st.ProbedAt) >= routeTTL {
 		return
 	}
@@ -424,7 +449,7 @@ func saveRouteState() {
 		return
 	}
 	routeCacheMu.Lock()
-	st := routeState{ProbedAt: routeCacheAt, Results: routeCache}
+	st := routeState{Version: routeStateVersion, ProbedAt: routeCacheAt, Results: routeCache}
 	routeCacheMu.Unlock()
 	data, err := json.Marshal(st)
 	if err != nil {

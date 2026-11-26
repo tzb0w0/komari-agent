@@ -19,6 +19,16 @@ import (
 
 var flags = pkg_flags.GlobalConfig
 
+func init() {
+	// 回程路由每轮探测完成后重新上报 basicInfo，
+	// 否则面板会一直停留在探针启动那一刻的线路快照（旧数据）。
+	monitoring.SetRoutesUpdatedHook(func() {
+		if err := uploadBasicInfo(); err != nil {
+			log.Println("Error uploading basic info after route refresh:", err)
+		}
+	})
+}
+
 func DoUploadBasicInfoWorks() {
 	ticker := time.NewTicker(time.Duration(flags.InfoReportInterval) * time.Minute)
 	for range ticker.C {
