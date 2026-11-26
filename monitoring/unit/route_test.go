@@ -2,84 +2,125 @@ package monitoring
 
 import "testing"
 
-// 判定口径：只看「跨境落地那一跳」——第一个进入国内骨干网的节点。
+// 判定口径与 nq 一致：第一个落地中国大陆的跳，其 ASN 决定线路。
 func TestClassifyHops(t *testing.T) {
+	// 用例取自用户实测的 nq 输出（广东电信 / 广东联通 / 广东移动）
+	asnTable := map[string][2]interface{}{
+		"199.102.1.1": {402506, "US"},
+		"218.30.54.1": {4134, "CN"},  // 上海 CHINANET-US
+		"59.43.246.1": {4809, "CN"},  // CN2 广州
+		"202.97.12.1": {4134, "CN"},  // 163 广州
+		"113.96.1.1":  {4134, "CN"},  // 广东电信
+		"162.219.1.1": {10099, "US"}, // CUG 洛杉矶
+		"43.255.1.1":  {10099, "HK"}, // CUG 香港
+		"218.105.2.1": {9929, "CN"},  // CUII 广州
+		"219.158.1.1": {4837, "CN"},  // 169 广州
+		"223.120.1.1": {58807, "US"}, // CMIN2 洛杉矶
+		"223.120.2.1": {58807, "CN"}, // CMIN2 上海
+		"221.183.1.1": {9808, "CN"},  // CMNET
+		"210.14.1.1":  {0, "CN"},     // 城域节点，无 ASN
+	}
+	restore := originASN
+	originASN = func(ip string) (int, string) {
+		if v, ok := asnTable[ip]; ok {
+			return v[0].(int), v[1].(string)
+		}
+		return 0, ""
+	}
+	asnCacheMu.Lock()
+	asnCache = map[string]asnInfo{}
+	asnFails, asnOff = 0, false
+	asnCacheMu.Unlock()
+	defer func() { originASN = restore }()
+
 	cases := []struct {
 		desc     string
 		hops     []string
 		wantName string
 		wantTier string
+		wantHop  string
 	}{
 		{
-			"电信 163：218.30 是国际出口，不算落地，落到 202.97",
-			[]string{"10.0.0.1", "186.244.1.1", "218.30.54.1", "202.97.12.1", "113.96.1.1"},
-			"163", "standard",
+			// nq: 广东 电信 AS402506 -> 163（路径里有 59.43，但落地 AS 是 4134）
+			"广东电信：落地 AS4134 判 163，即使中途经过 CN2",
+			[]string{"199.102.1.1", "218.30.54.1", "59.43.246.1", "202.97.12.1", "113.96.1.1"},
+			"163", "standard", "218.30.54.1",
 		},
 		{
-			"电信 CN2 GIA：218.30 之后落到 59.43",
-			[]string{"10.0.0.1", "218.30.54.1", "59.43.246.1", "59.43.130.1"},
-			"CN2 GIA", "premium",
+			// nq: 广东 联通 AS402506 -> 9929（香港段 AS10099 不算落地）
+			"广东联通：境外 CUG 跳跳过，落地 AS9929 判 9929",
+			[]string{"199.102.1.1", "162.219.1.1", "43.255.1.1", "218.105.2.1", "219.158.1.1"},
+			"9929", "premium", "218.105.2.1",
 		},
 		{
-			"联通 9929：落地在 218.105",
-			[]string{"162.219.1.1", "43.255.1.1", "218.105.2.1", "210.14.1.1", "219.158.1.1"},
-			"9929", "premium",
+			// nq: 广东 移动 AS402506 -> CMIN2
+			"广东移动：落地 AS58807 判 CMIN2",
+			[]string{"199.102.1.1", "223.120.1.1", "223.120.2.1", "221.183.1.1"},
+			"CMIN2", "premium", "223.120.2.1",
 		},
 		{
-			"联通 9929 另一段：210.51",
-			[]string{"218.105.1.1", "210.51.1.1"},
-			"9929", "premium",
+			"跨网：电信目标落地 AS9929 就应显示 9929",
+			[]string{"199.102.1.1", "218.105.2.1"},
+			"9929", "premium", "218.105.2.1",
 		},
 		{
-			"联通 169：落地在 219.158",
-			[]string{"162.219.1.1", "219.158.1.1", "219.158.2.1"},
-			"169", "standard",
+			"跨网：联通目标落地 AS4809 就应显示 CN2 GIA",
+			[]string{"199.102.1.1", "59.43.246.1"},
+			"CN2 GIA", "premium", "59.43.246.1",
 		},
-		{
-			"移动普通 CMI：223.120 不能标成 CMIN2",
-			[]string{"223.120.1.1", "221.183.1.1", "111.24.1.1"},
-			"CMI", "standard",
-		},
-		{
-			"移动 CMIN2：223.119 才是精品网",
-			[]string{"223.119.1.1", "223.118.1.1", "221.176.1.1"},
-			"CMIN2", "premium",
-		},
-		{
-			"移动 CMNET：落地在 221.183",
-			[]string{"111.24.1.1", "221.183.1.1"},
-			"CMNET", "standard",
-		},
-		{
-			"只有城域节点时不做线路命名",
-			[]string{"210.14.1.1"},
-			"未知", "unknown",
-		},
-		{
-			"未知路径",
-			[]string{"1.2.3.4", "5.6.7.8"},
-			"未知", "unknown",
-		},
-		{"空路径", nil, "未知", "unknown"},
 	}
 	for _, c := range cases {
-		gotName, gotTier, _ := classifyHops(c.hops)
-		if gotName != c.wantName || gotTier != c.wantTier {
-			t.Errorf("%s: got (%s,%s), want (%s,%s)", c.desc, gotName, gotTier, c.wantName, c.wantTier)
+		gotName, gotTier, gotHop := classifyHops(c.hops)
+		if gotName != c.wantName || gotTier != c.wantTier || gotHop != c.wantHop {
+			t.Errorf("%s: got (%s,%s,%s), want (%s,%s,%s)", c.desc,
+				gotName, gotTier, gotHop, c.wantName, c.wantTier, c.wantHop)
+		}
+	}
+
+	// ASN 完全不可用时退回前缀表，保证不会整块变未知
+	originASN = func(ip string) (int, string) { return 0, "" }
+	asnCacheMu.Lock()
+	asnCache = map[string]asnInfo{}
+	asnFails, asnOff = 0, false
+	asnCacheMu.Unlock()
+	fallback := []struct {
+		hops []string
+		want string
+	}{
+		{[]string{"218.30.54.1", "202.97.12.1"}, "163"},
+		{[]string{"59.43.246.1"}, "CN2 GIA"},
+		{[]string{"218.105.2.1"}, "9929"},
+		{[]string{"223.120.2.1"}, "CMIN2"},
+		{[]string{"210.14.1.1"}, "未知"},
+	}
+	for _, c := range fallback {
+		if got, _, _ := classifyHops(c.hops); got != c.want {
+			t.Errorf("fallback %v: got %s, want %s", c.hops, got, c.want)
 		}
 	}
 }
 
 func TestPathSummary(t *testing.T) {
+	restore := originASN
+	originASN = func(ip string) (int, string) {
+		if ip == "202.97.12.1" {
+			return 4134, "CN"
+		}
+		return 0, ""
+	}
+	asnCacheMu.Lock()
+	asnCache = map[string]asnInfo{}
+	asnFails, asnOff = 0, false
+	asnCacheMu.Unlock()
+	defer func() { originASN = restore }()
+
 	hops := []string{"10.0.0.1", "218.30.54.1", "202.97.12.1", "113.96.1.1"}
 	got := pathSummary(hops, "202.97.12.1")
-	want := "10.0.0.1 → 218.30.54.1 → 202.97.12.1（第3跳/共4跳）"
+	want := "10.0.0.1 → 218.30.54.1 → 202.97.12.1(AS4134/CN)（第3跳/共4跳）"
 	if got != want {
 		t.Errorf("pathSummary = %q, want %q", got, want)
 	}
-	// 未命中时回落到最后一跳，仍可看出确实探测过
-	got = pathSummary(hops, "")
-	if got != "10.0.0.1 → 218.30.54.1 → 202.97.12.1 → 113.96.1.1（第4跳/共4跳）" {
+	if got := pathSummary(hops, ""); got != "10.0.0.1 → 218.30.54.1 → 202.97.12.1 → 113.96.1.1（第4跳/共4跳）" {
 		t.Errorf("pathSummary fallback = %q", got)
 	}
 }

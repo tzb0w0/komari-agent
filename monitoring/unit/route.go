@@ -152,47 +152,58 @@ type backboneRule struct {
 	carrier string // 电信 / 联通 / 移动
 }
 
-// backboneRules 是线路识别表，前缀归属全部按运营商真实分配：
+// backboneRules 是「前缀兜底表」，只在拿不到 ASN 时使用（DNS 不可用）。
+// 主判据见 asnRules / classifyByLandingASN。
 //
-//	电信 163(AS4134)      202.97. / 113.96.
+//	电信 163(AS4134)      202.97. / 113.96. / 218.30.（国际段，落地仍属 163 网）
 //	电信 CN2(AS4809)      59.43.
 //	联通 9929/CUII        218.105. / 210.51.
 //	联通 169(AS4837)      219.158.
-//	移动 CMI(AS58453)     223.120.
-//	移动 CMIN2(AS58807)   223.118. / 223.119.
+//	移动 CMIN2(AS58807)   223.120. / 223.118. / 223.119.
 //	移动 CMNET(AS9808)    221.176. / 221.183. / 111.24.
-//
-// 只保留「产品级」线路名；城域节点（210.14/211.136 等）不算线路，
-// 命中不了就显示「未知」并在 tooltip 里给出末跳，避免把城市骨干误标成线路。
 var backboneRules = []backboneRule{
 	{"59.43.", "CN2 GIA", "premium", "电信"},  // AS4809 电信 CN2 GIA
-	{"113.96.", "163", "standard", "电信"},     // AS4134 广东电信
-	{"202.97.", "163", "standard", "电信"},     // AS4134 电信 163 骨干
+	{"218.30.", "163", "standard", "电信"},    // AS4134 ChinaNet 国际段
+	{"202.97.", "163", "standard", "电信"},    // AS4134 电信 163 骨干
+	{"113.96.", "163", "standard", "电信"},    // AS4134 广东电信
 	{"218.105.", "9929", "premium", "联通"},   // AS9929 联通 CUII
 	{"210.51.", "9929", "premium", "联通"},    // AS9929 联通 CUII
 	{"219.158.", "169", "standard", "联通"},   // AS4837 联通 169 骨干
+	{"223.120.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
 	{"223.118.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
 	{"223.119.", "CMIN2", "premium", "移动"},  // AS58807 移动 CMIN2
-	{"223.120.", "CMI", "standard", "移动"},   // AS58453 移动 CMI（普通国际出口）
 	{"221.176.", "CMNET", "standard", "移动"}, // AS9808 移动 CMNET
 	{"221.183.", "CMNET", "standard", "移动"}, // AS9808 移动 CMNET
 	{"111.24.", "CMNET", "standard", "移动"},  // AS9808 移动 CMNET
 }
 
-// backboneSkip 是国际段前缀：看到它们说明还没进入内地骨干，继续看下一跳。
-// 218.30.x.x 属于中国电信 ChinaNet 国际出口（AS4835），
-// 它既不是 9929 也不是任何产品线，必须跳过，否则整条电信回程会被误标成 9929。
-var backboneSkip = []string{"218.30.", "162.219.", "43.255.", "203.160."}
+// asnRules 是主判据：跨境落地跳的 ASN 决定线路。
+// 这是 nq / nexttrace 这类工具的口径，也是唯一能覆盖「跨网」的做法——
+// 电信目标可能落地在 AS9929（走 9929），联通目标可能落地在 AS4809（走 CN2），
+// 与监控行的运营商无关。
+var asnRules = map[int]backboneRule{
+	4134:  {"", "163", "standard", "电信"},    // ChinaNet 163
+	4809:  {"", "CN2 GIA", "premium", "电信"}, // CN2
+	9929:  {"", "9929", "premium", "联通"},    // CUII 联通 A 网
+	4837:  {"", "169", "standard", "联通"},    // China169
+	58807: {"", "CMIN2", "premium", "移动"},   // 移动精品国际网
+	58453: {"", "CMI", "standard", "移动"},    // 移动国际普通出口
+	9808:  {"", "CMNET", "standard", "移动"},  // 移动国内骨干
+}
+
+// backboneSkip 是纯国际段前缀（联通 CUG、电信 CTG 等），不代表回国线路，
+// 仅在前缀兜底时跳过。
+var backboneSkip = []string{"162.219.", "43.255.", "203.160."}
 
 var (
-	routeCache    []RouteInfo
-	routeCacheAt  time.Time
-	routeCacheMu  sync.Mutex
-	routeRunning  bool
-	routeTTL      = 24 * time.Hour
-	hopLineRe     = regexp.MustCompile(`^\s*(\d+)\s+([0-9a-fA-F:.]+)`)
+	routeCache   []RouteInfo
+	routeCacheAt time.Time
+	routeCacheMu sync.Mutex
+	routeRunning bool
+	routeTTL     = 24 * time.Hour
+	hopLineRe    = regexp.MustCompile(`^\s*(\d+)\s+([0-9a-fA-F:.]+)`)
 	// mtr -r -n 的行格式是 ` 1.|-- 1.2.3.4 ...`，与 traceroute 不同
-	mtrLineRe = regexp.MustCompile(`^\s*(\d+)\.\|--\s+([0-9a-fA-F:.]+)`)
+	mtrLineRe     = regexp.MustCompile(`^\s*(\d+)\.\|--\s+([0-9a-fA-F:.]+)`)
 	maxRouteHops  = "20"
 	routeProbeTmo = 45 * time.Second
 
@@ -208,7 +219,7 @@ var (
 
 // routeStateVersion 标识缓存格式；旧版本缓存（可能含运营商名 / ASN 等
 // 非线路名的脏数据）一律丢弃，等本进程重新探测后再落盘。
-const routeStateVersion = 4
+const routeStateVersion = 5
 
 // routeState 是落盘的探测结果，保证重启后首屏不至于空白。
 type routeState struct {
@@ -338,22 +349,134 @@ func pathSummary(hops []string, matched string) string {
 	if start < 0 {
 		start = 0
 	}
+	parts := append([]string{}, hops[start:idx+1]...)
+	if matched != "" {
+		if asn, cc, found := originASNCached(matched); found {
+			parts[len(parts)-1] += fmt.Sprintf("(AS%d/%s)", asn, cc)
+		}
+	}
 	return fmt.Sprintf("%s（第%d跳/共%d跳）",
-		strings.Join(hops[start:idx+1], " → "), idx+1, len(hops))
+		strings.Join(parts, " → "), idx+1, len(hops))
 }
 
-// classifyHops 判定回程线路：只看「跨境落地那一跳」。
+// ---- 跨境落地跳的 ASN / 国家判定 ----
 //
-// 这是行业通行口径，也是用户明确要求的：从本机 traceroute 国内目标，
-// 第一个进入中国大陆骨干网的节点，就是这段回程的入境线路。
-// 例如 ... -> 218.30.x（电信国际出口，仍属境外段）-> 202.97.x -> 目标，
-// 落地跳是 202.97，线路即 163。
+// 通过 Team Cymru 的 DNS 接口查每个跳的 ASN 与注册国家：
 //
-// 注意：
-//   - 不能按「目的运营商」去翻后面的跳，那会把中转段误当成线路；
-//   - 必须先跳过国际出口段（218.30 等），它们不是产品线；
-//   - 取第一个命中即可，后面的跳只代表国内落地后的省内走向。
+//	<reversed-ip>.origin.asn.cymru.com  TXT -> "4134 | 218.30.0.0/16 | CN | apnic | 2002-03-15"
+//
+// 第一个 cc=="CN" 的跳就是「跨境落地那一跳」，其 ASN 决定线路。
+// 查询失败会熔断（asnOff），整块退回前缀表，不会因为 DNS 不通而卡死或变未知。
+var (
+	asnCacheMu sync.Mutex
+	asnCache   = map[string]asnInfo{}
+	asnFails   int
+	asnOff     bool
+
+	// originASN 可在测试中替换
+	originASN = lookupOriginASN
+)
+
+type asnInfo struct {
+	asn int
+	cc  string
+	ok  bool
+}
+
+func originASNCached(ip string) (int, string, bool) {
+	// 私有/保留地址（192.168.x、10.x、链路本地等）不可能有 ASN，
+	// 直接跳过，且不计入失败次数——否则开头几个内网跳就会把熔断打满。
+	if parsed := net.ParseIP(ip); parsed == nil || isNonRoutable(parsed) {
+		return 0, "", false
+	}
+
+	asnCacheMu.Lock()
+	if v, hit := asnCache[ip]; hit {
+		asnCacheMu.Unlock()
+		return v.asn, v.cc, v.ok
+	}
+	off := asnOff
+	asnCacheMu.Unlock()
+	if off {
+		return 0, "", false
+	}
+
+	asn, cc := originASN(ip)
+
+	asnCacheMu.Lock()
+	defer asnCacheMu.Unlock()
+	if asn == 0 {
+		asnFails++
+		if asnFails >= 4 {
+			asnOff = true
+		}
+	} else {
+		asnFails = 0
+	}
+	asnCache[ip] = asnInfo{asn: asn, cc: cc, ok: asn != 0}
+	return asn, cc, asn != 0
+}
+
+func isNonRoutable(ip net.IP) bool {
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
+func lookupOriginASN(ip string) (int, string) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return 0, ""
+	}
+	var q string
+	if v4 := parsed.To4(); v4 != nil {
+		q = fmt.Sprintf("%d.%d.%d.%d.origin.asn.cymru.com", v4[3], v4[2], v4[1], v4[0])
+	} else {
+		b := parsed.To16()
+		if b == nil {
+			return 0, ""
+		}
+		const hexDigits = "0123456789abcdef"
+		var sb strings.Builder
+		for i := len(b) - 1; i >= 0; i-- {
+			sb.WriteByte(hexDigits[b[i]&0x0f])
+			sb.WriteByte('.')
+			sb.WriteByte(hexDigits[b[i]>>4])
+			sb.WriteByte('.')
+		}
+		q = sb.String() + "origin6.asn.cymru.com"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	txts, err := net.DefaultResolver.LookupTXT(ctx, q)
+	if err != nil || len(txts) == 0 {
+		return 0, ""
+	}
+	fields := strings.Split(txts[0], "|")
+	if len(fields) < 3 {
+		return 0, ""
+	}
+	asnStr := strings.TrimSpace(fields[0])
+	if i := strings.IndexByte(asnStr, ' '); i > 0 {
+		asnStr = asnStr[:i]
+	}
+	asn, err := strconv.Atoi(asnStr)
+	if err != nil || asn == 0 {
+		return 0, ""
+	}
+	return asn, strings.ToUpper(strings.TrimSpace(fields[2]))
+}
+
+// classifyHops 判定回程线路。
+//
+// 主判据是「跨境落地那一跳」的 ASN：路径上第一个位于中国大陆的跳，
+// 其 ASN 决定这段回程走哪张网——与监控行的运营商无关，允许跨网
+// （电信目标落地 AS9929 就是 9929，联通目标落地 AS4809 就是 CN2）。
+// 取不到 ASN 时才退回前缀表，避免 DNS 不可用时整块变「未知」。
 func classifyHops(hops []string) (name, tier, hop string) {
+	if name, tier, hop, ok := classifyByLandingASN(hops); ok {
+		return name, tier, hop
+	}
 	for _, h := range hops {
 		if isInternationalLeg(h) {
 			continue
@@ -366,6 +489,26 @@ func classifyHops(hops []string) (name, tier, hop string) {
 		}
 	}
 	return "未知", "unknown", ""
+}
+
+// classifyByLandingASN 找第一个落地中国大陆的跳，用它的 ASN 定线路。
+func classifyByLandingASN(hops []string) (name, tier, hop string, ok bool) {
+	limit := len(hops)
+	if limit > 16 {
+		limit = 16 // 落地跳不会太靠后，限制查询次数
+	}
+	for i := 0; i < limit; i++ {
+		h := hops[i]
+		asn, cc, found := originASNCached(h)
+		if !found || cc != "CN" {
+			continue
+		}
+		if rule, hit := asnRules[asn]; hit {
+			return rule.name, rule.tier, h, true
+		}
+		// 大陆境内但不在线路表（省级/地市 AS）：继续往后找已知骨干
+	}
+	return "", "", "", false
 }
 
 func isInternationalLeg(ip string) bool {
