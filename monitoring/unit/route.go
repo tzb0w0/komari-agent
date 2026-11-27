@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -318,7 +320,7 @@ func probeRoute(carrier, host string, port int, pingType string) RouteInfo {
 		return info
 	}
 
-	c := classifyRoute(hops)
+	c := classifyRoute(hops, host)
 	info.Name, info.Tier = c.name, c.tier
 	info.Backbone = c.carrier
 	info.Cross = carrier != "" && c.carrier != "" && carrier != c.carrier
@@ -341,16 +343,24 @@ func pathSummary(hops []string, matched string) string {
 				break
 			}
 		}
+	} else {
+		// 未命中骨干特征时锚在「最后一条查得到 ASN 的跳」：
+		// traceroute 末尾常是回包被过滤的跳（无 ASN），拿它当落地点只会
+		// 让人以为是路径终点；这里更想说明的是「路径最后落在哪个网络」。
+		for i := len(hops) - 1; i >= 0; i-- {
+			if _, _, ok := originASNCached(hops[i]); ok {
+				idx = i
+				break
+			}
+		}
 	}
 	start := idx - 3
 	if start < 0 {
 		start = 0
 	}
 	parts := append([]string{}, hops[start:idx+1]...)
-	if matched != "" {
-		if asn, cc, found := originASNCached(matched); found {
-			parts[len(parts)-1] += fmt.Sprintf("(AS%d/%s)", asn, cc)
-		}
+	if asn, cc, found := originASNCached(hops[idx]); found {
+		parts[len(parts)-1] += fmt.Sprintf("(AS%d/%s)", asn, cc)
 	}
 	return fmt.Sprintf("%s（第%d跳/共%d跳）",
 		strings.Join(parts, " → "), idx+1, len(hops))
@@ -369,15 +379,19 @@ var (
 	asnCache   = map[string]asnInfo{}
 	asnFails   int
 	asnOff     bool
+	asnOffAt   time.Time
 
 	// originASN 可在测试中替换
 	originASN = lookupOriginASN
+
+	dohClient = &http.Client{Timeout: 3 * time.Second}
 )
 
 type asnInfo struct {
 	asn int
 	cc  string
 	ok  bool
+	at  time.Time
 }
 
 func originASNCached(ip string) (int, string, bool) {
@@ -389,8 +403,20 @@ func originASNCached(ip string) (int, string, bool) {
 
 	asnCacheMu.Lock()
 	if v, hit := asnCache[ip]; hit {
-		asnCacheMu.Unlock()
-		return v.asn, v.cc, v.ok
+		// 成功结果可长期用；失败结果只缓存 5 分钟，DNS 恢复后不必等进程重启
+		ttl := time.Hour
+		if !v.ok {
+			ttl = 5 * time.Minute
+		}
+		if time.Since(v.at) < ttl {
+			asnCacheMu.Unlock()
+			return v.asn, v.cc, v.ok
+		}
+		delete(asnCache, ip)
+	}
+	// 熔断带自动恢复：一次 DNS 抖动不该让整机一整天都判不出线路
+	if asnOff && time.Since(asnOffAt) > 10*time.Minute {
+		asnOff, asnFails = false, 0
 	}
 	off := asnOff
 	asnCacheMu.Unlock()
@@ -406,11 +432,12 @@ func originASNCached(ip string) (int, string, bool) {
 		asnFails++
 		if asnFails >= 4 {
 			asnOff = true
+			asnOffAt = time.Now()
 		}
 	} else {
 		asnFails = 0
 	}
-	asnCache[ip] = asnInfo{asn: asn, cc: cc, ok: asn != 0}
+	asnCache[ip] = asnInfo{asn: asn, cc: cc, ok: asn != 0, at: time.Now()}
 	return asn, cc, asn != 0
 }
 
@@ -444,14 +471,26 @@ func lookupOriginASN(ip string) (int, string) {
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
 	txts, err := net.DefaultResolver.LookupTXT(ctx, q)
+	cancel()
 	if err != nil || len(txts) == 0 {
-		return 0, ""
+		// 系统 DNS 查 TXT 被劫持 / 超时很常见（境外小机房尤其），
+		// 走 DoH 再试一次——否则整条判定会退化成前缀表，境外路径直接「未知」。
+		txts = lookupTXTDoH(q)
 	}
-	fields := strings.Split(txts[0], "|")
+	for _, txt := range txts {
+		if asn, cc, ok := parseASNTXT(txt); ok {
+			return asn, cc
+		}
+	}
+	return 0, ""
+}
+
+// parseASNTXT 解析 Cymru 的 TXT 记录："4134 | 218.30.0.0/16 | CN | apnic | 2002-03-15"。
+func parseASNTXT(txt string) (int, string, bool) {
+	fields := strings.Split(txt, "|")
 	if len(fields) < 3 {
-		return 0, ""
+		return 0, "", false
 	}
 	asnStr := strings.TrimSpace(fields[0])
 	if i := strings.IndexByte(asnStr, ' '); i > 0 {
@@ -459,9 +498,48 @@ func lookupOriginASN(ip string) (int, string) {
 	}
 	asn, err := strconv.Atoi(asnStr)
 	if err != nil || asn == 0 {
-		return 0, ""
+		return 0, "", false
 	}
-	return asn, strings.ToUpper(strings.TrimSpace(fields[2]))
+	return asn, strings.ToUpper(strings.TrimSpace(fields[2])), true
+}
+
+// lookupTXTDoH 用 DNS-over-HTTPS 查 TXT，绕开被劫持的 53 端口。
+func lookupTXTDoH(name string) []string {
+	endpoints := []string{
+		"https://cloudflare-dns.com/dns-query?type=TXT&name=" + url.QueryEscape(name),
+		"https://dns.google/resolve?type=TXT&name=" + url.QueryEscape(name),
+	}
+	for _, u := range endpoints {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("accept", "application/dns-json")
+		resp, err := dohClient.Do(req)
+		if err != nil {
+			continue
+		}
+		var body struct {
+			Answer []struct {
+				Data string `json:"data"`
+			} `json:"Answer"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&body)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		out := make([]string, 0, len(body.Answer))
+		for _, a := range body.Answer {
+			if d := strings.Trim(a.Data, "\""); d != "" {
+				out = append(out, d)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
 }
 
 // routeClass 是单条目标的判定结果。
@@ -580,7 +658,7 @@ func pick(f routeFeature, hop string) routeClass {
 //
 // 判定与目标运营商无关：电信目标回程走 9929 就判 9929，联通目标走
 // CN2 就判 CN2，跨网由 buildRouteLabel 标注，不强行归到本网。
-func classifyRoute(hops []string) routeClass {
+func classifyRoute(hops []string, target ...string) routeClass {
 	if len(hops) == 0 {
 		return routeClass{name: "未知", tier: "unknown"}
 	}
@@ -626,7 +704,41 @@ func classifyRoute(hops []string) routeClass {
 	if ok, hop := firstHit(featCMNET, facts); ok {
 		return pick(featCMNET, hop)
 	}
+	// 规则表外兜底：路径上骨干特征跳全部不回包（境外节点很常见，尤其
+	// traceroute 后段被过滤），此时按「目标地址自己的 ASN 归属」反推线路，
+	// 否则面板只能显示「未知」——信息量为零，用户也无法区分是判错还是没探测到。
+	if len(target) > 0 && target[0] != "" {
+		if asn, _, ok := originASNCached(target[0]); ok {
+			if f, found := featureForASN(asn); found {
+				return pick(f, target[0])
+			}
+		}
+	}
 	return routeClass{name: "未知", tier: "unknown"}
+}
+
+// featureForASN 把目标地址的 ASN 映射回线路特征。
+// 只用于「一个骨干特征跳都没命中」的兜底，正常路径仍以路径特征为准。
+func featureForASN(asn int) (routeFeature, bool) {
+	switch asn {
+	case 4809:
+		// 目标属 AS4809 说明是 CN2 地址，但 GIA / GT 只能看路径（59.43 + 202.97），
+		// 路径没回包时分不出来，按 GT 保守判。
+		return featCN2GT, true
+	case 9929:
+		return feat9929, true
+	case 58807:
+		return featCMIN2, true
+	case 4837:
+		return feat169, true
+	case 58453:
+		return featCMI, true
+	case 4134:
+		return feat163, true
+	case 9808:
+		return featCMNET, true
+	}
+	return routeFeature{}, false
 }
 
 // classifyHops 保留旧签名，供测试与调用方使用。

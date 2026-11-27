@@ -27,7 +27,26 @@ var (
 	v2AckMu       sync.Mutex
 	v2AckEventIDs []string
 	v2SeenEvents  = make(map[string]time.Time)
+
+	// 同一 ping 任务最近的执行时间，用于压掉重复下发
+	pingLastRun sync.Map // taskID(uint) -> time.Time
 )
+
+// allowPingRun 限制同一任务的最小执行间隔。默认调度间隔是分钟级，
+// 3 秒内重复收到只可能是服务端重复调度或绑定列表重复，跳过即可。
+func allowPingRun(taskID uint) bool {
+	if taskID == 0 {
+		return false
+	}
+	now := time.Now()
+	if prev, ok := pingLastRun.Load(taskID); ok {
+		if last, ok := prev.(time.Time); ok && now.Sub(last) < 3*time.Second {
+			return false
+		}
+	}
+	pingLastRun.Store(taskID, now)
+	return true
+}
 
 const (
 	v2SeenEventTTL   = 10 * time.Minute
@@ -380,7 +399,12 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 		if err := v2.BindParams(params, &p); err == nil {
 			// 记录后台监控目标，回程线路探测就用这些地址，保证「测的就是你监控的」
 			unit.SetRouteTarget(p.TaskID, p.Name, p.Target, p.Type)
-			go NewPingTask(conn, p.TaskID, p.Type, p.Target)
+			// 同一任务 3 秒内重复下发只执行一次：服务端重复调度、或任务绑定列表
+			// 里同一台机器出现多次时，同一目标会在同一秒收到多组探测包，
+			// 对端 ICMP 限速后表现就是「丢包突然飙高」。
+			if allowPingRun(p.TaskID) {
+				go NewPingTask(conn, p.TaskID, p.Type, p.Target)
+			}
 			return true
 		} else {
 			log.Printf("bad v2 ping params: %v", err)

@@ -220,8 +220,38 @@ func TestPathSummary(t *testing.T) {
 	if got != want {
 		t.Errorf("pathSummary = %q, want %q", got, want)
 	}
-	if got := pathSummary(hops, ""); got != "10.0.0.1 → 218.30.54.1 → 202.97.12.1 → 113.96.1.1（第4跳/共4跳）" {
+	if got := pathSummary(hops, ""); got != "10.0.0.1 → 218.30.54.1 → 202.97.12.1(AS4134/CN)（第3跳/共4跳）" {
 		t.Errorf("pathSummary fallback = %q", got)
+	}
+}
+
+// 境外节点常见：路径后段全被过滤，一个骨干特征跳都不回包。
+// 此时按目标地址自己的 ASN 兜底，避免整片「未知」。
+func TestClassifyTargetASNFallback(t *testing.T) {
+	setASNResolver(t, func(ip string) (int, string) {
+		if v, ok := testASNTable[ip]; ok {
+			return v[0].(int), v[1].(string)
+		}
+		return 0, ""
+	})
+
+	// 德国 → 中国：中间全是国际段，后段跳全部不回包
+	hops := []string{"84.149.137.14", "195.219.68.127"}
+	c := classifyRoute(hops, "113.96.1.1")
+	if c.name != "163" {
+		t.Errorf("target ASN fallback = %q, want 163", c.name)
+	}
+
+	// 目标属 CN2，路径没回包 → 保守判 CN2 GT
+	c = classifyRoute(hops, "59.43.246.1")
+	if c.name != "CN2 GT" {
+		t.Errorf("CN2 target fallback = %q, want CN2 GT", c.name)
+	}
+
+	// 目标 ASN 不在三大运营商表内 → 仍然未知
+	c = classifyRoute(hops, "199.102.1.1")
+	if c.name != "未知" {
+		t.Errorf("foreign target = %q, want 未知", c.name)
 	}
 }
 

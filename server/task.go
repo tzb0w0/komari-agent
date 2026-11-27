@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
@@ -138,33 +139,118 @@ func httpPing(target string, timeout time.Duration) (int64, error) {
 	return latency, errors.New("http status not ok")
 }
 
-func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
-	if taskID == 0 {
-		log.Printf("Invalid task ID: %d", taskID)
-		return
-	}
-	var err error = nil
-	var latency int64
-	pingResult := -1
-	timeout := 3 * time.Second           // 默认超时时间
-	const highLatencyThreshold = 1000    // ms 阈值
-	const retryDropThresholdTcping = 800 // ms 重试中延迟降低超过此值则基本认为发生重传
-	// 800ms = SYN/SYN-ACK 首次超时重传 1000ms - 防误判容许 200ms 延迟抖动
+// ---- 同一探测目标的串行化与短时复用 ----
 
+const (
+	highLatencyThreshold     = 1000 // ms 阈值
+	retryDropThresholdTcping = 800  // ms 重试中延迟降低超过此值则基本认为发生重传
+	// 800ms = SYN/SYN-ACK 首次超时重传 1000ms - 防误判容许 200ms 延迟抖动
+	pingMeasureWindow = 5 * time.Second
+	// 不同目标之间的最小间隔。同一秒并发开多个 raw ICMP socket 时，
+	// 回包会被别的协程抢先读走（实测 4 并发只收齐 3 个），
+	// 原本正常的目标因此报「no packets received」。
+	pingGap = time.Second
+)
+
+type pingMeasurement struct {
+	latency int64
+	err     error
+	at      time.Time
+}
+
+var (
+	pingMeasureMu sync.Mutex
+	pingMeasures  = map[string]pingMeasurement{}
+	pingKeyLocks  sync.Map // target key -> *sync.Mutex
+
+	pingExecMu   sync.Mutex // 全局串行：同一时刻只跑一个测量
+	pingLastDone time.Time  // 上一次测量结束时间（受 pingExecMu 保护）
+)
+
+func cachedMeasurement(key string) (int64, error, bool) {
+	pingMeasureMu.Lock()
+	defer pingMeasureMu.Unlock()
+	if hit, ok := pingMeasures[key]; ok && time.Since(hit.at) < pingMeasureWindow {
+		return hit.latency, hit.err, true
+	}
+	return 0, nil, false
+}
+
+func storeMeasurement(key string, latency int64, err error) {
+	pingMeasureMu.Lock()
+	defer pingMeasureMu.Unlock()
+	now := time.Now()
+	pingMeasures[key] = pingMeasurement{latency: latency, err: err, at: now}
+	for k, v := range pingMeasures {
+		if now.Sub(v.at) > time.Minute {
+			delete(pingMeasures, k)
+		}
+	}
+}
+
+// measureForTarget 同一目标在窗口内复用结果，且不同目标之间串行、间隔 1 秒。
+//
+// 串行的原因不是目标限速，而是本机收包：探针通常跑在 VPC 内网（10.x），
+// 出公网要走宿主 NAT。多个 raw ICMP socket 在同一毫秒发出、同一毫秒等待时，
+// 宿主机做 SNAT 会话映射会发生状态覆盖，且回包到达后会向所有 raw socket 广播，
+// 并发读的情况下有的协程拿到自己的、有的拿到别人的并被丢弃——表现出来就是
+// 「延迟明明 168ms、却报 no packets received」。错开 1 秒后每个包独立完成
+// 一次收发，丢包率才等于真实值。
+func measureForTarget(pingType, target string, timeout time.Duration) (int64, error) {
+	key := pingType + "|" + target
+
+	if latency, err, ok := cachedMeasurement(key); ok {
+		return latency, err
+	}
+
+	// 同一目标先串行，避免重复发包
+	lock, _ := pingKeyLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := lock.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if latency, err, ok := cachedMeasurement(key); ok {
+		return latency, err
+	}
+
+	// 不同目标之间串行，且至少间隔 pingGap
+	pingExecMu.Lock()
+	defer pingExecMu.Unlock()
+
+	// 排队期间可能已经有别的协程测完了同一目标
+	if latency, err, ok := cachedMeasurement(key); ok {
+		return latency, err
+	}
+	if !pingLastDone.IsZero() {
+		if wait := pingGap - time.Since(pingLastDone); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+
+	latency, err := pingOnce(pingType, target, timeout)
+	pingLastDone = time.Now()
+	storeMeasurement(key, latency, err)
+	return latency, err
+}
+
+// pingOnce 执行一次完整测量，含高延迟重试（与上游实现保持一致）。
+func pingOnce(pingType, target string, timeout time.Duration) (int64, error) {
 	measure := func() (int64, error) {
 		switch pingType {
 		case "icmp":
-			return icmpPing(pingTarget, timeout)
+			return icmpPing(target, timeout)
 		case "tcp":
-			return tcpPing(pingTarget, timeout)
+			return tcpPing(target, timeout)
 		case "http":
-			return httpPing(pingTarget, timeout)
+			return httpPing(target, timeout)
 		default:
 			return -1, errors.New("unsupported ping type")
 		}
 	}
+
+	var latency int64
+	var err error
 	PingHighLatencyRetries := 3
-	// 首次测量
 	if latency, err = measure(); err == nil {
 		firstLatency := latency
 		if latency > int64(highLatencyThreshold) && PingHighLatencyRetries > 0 {
@@ -189,10 +275,25 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 			}
 		}
 	}
+	return latency, err
+}
 
+func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
+	if taskID == 0 {
+		log.Printf("Invalid task ID: %d", taskID)
+		return
+	}
+	timeout := 3 * time.Second // 默认超时时间
+
+	// 同一目标在窗口内只真正探测一次：多个监控任务指向同一个 IP 时，各自发一包
+	// 会在同一秒叠加，目标侧 ICMP 限速只回其中一个，表现就是「一个任务 60% 丢包、
+	// 另一个 0%」。复用结果既还原真实丢包率，也避免自己把自己打出限速。
+	latency, err := measureForTarget(pingType, pingTarget, timeout)
+
+	pingResult := -1
 	if err != nil {
-		log.Printf("Ping task %d failed: %v", taskID, err)
-		pingResult = -1 // 如果有错误，设置结果为 -1
+		// 带上目标，排查时能直接看出是哪个 IP 没回包
+		log.Printf("Ping task %d (%s %s) failed: %v", taskID, pingType, pingTarget, err)
 	} else {
 		pingResult = int(latency)
 	}
